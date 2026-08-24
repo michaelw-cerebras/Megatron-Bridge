@@ -9,6 +9,16 @@ python benchmark_datatrove.py \
 --workers 16 \
 --discard-output
 
+
+for WORKERS in 48 64 96; do
+  python benchmark_datatrove.py \
+    --manifest /cb/home/michaelw/ws/Megatron-Bridge/mw_scripts/benchmark_throughput/benchmark_data/manifest.json \
+    --run-dir "/cb/home/michaelw/ws/Megatron-Bridge/mw_scripts/benchmark_throughput/benchmark_data/runs/datatrove_w${WORKERS}_96c" \
+    --tasks 192 \
+    --workers "$WORKERS" \
+    --discard-output
+done
+
 """
 
 import argparse

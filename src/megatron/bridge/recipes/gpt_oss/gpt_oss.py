@@ -33,15 +33,20 @@ def _enable_gpt_oss_hopper_fp8_current_scaling(cfg: ConfigContainer) -> ConfigCo
     return cfg
 
 
-def gpt_oss_20b_pretrain_config() -> ConfigContainer:
+def gpt_oss_20b_pretrain_config(hf_model_id: str = "openai/gpt-oss-20b") -> ConfigContainer:
     """Return a pre-training config for GPT-OSS 20B variant.
+
+    Args:
+        hf_model_id: Hugging Face model identifier or local directory containing
+            the model ``config.json``. A local directory supports air-gapped
+            pretraining without downloading model weights.
 
     Recommended parallelism: TP=2, PP=4, EP=4
     """
     cfg = _pretrain_common()
 
     # Model config
-    cfg.model = AutoBridge.from_hf_pretrained("openai/gpt-oss-20b").to_megatron_provider(load_weights=False)
+    cfg.model = AutoBridge.from_hf_pretrained(hf_model_id).to_megatron_provider(load_weights=False)
 
     # Tokenizer - uses NullTokenizer by default
     cfg.tokenizer.tokenizer_type = "NullTokenizer"
