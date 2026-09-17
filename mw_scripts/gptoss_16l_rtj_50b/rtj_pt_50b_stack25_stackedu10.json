@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "name": "rtj-pt-50b-stack25-stackedu10",
+  "description": "GPT-OSS 16L RTJ PT 50B blend with 10% shifted from Stack-V2 to Stack-Edu.",
+  "train_tokens": 50000000000,
+  "source_weights": {
+    "dclm-edu": 0.08,
+    "finemath": 0.08,
+    "finepdf": 0.08,
+    "stack-v2": 0.25,
+    "stack-edu": 0.10,
+    "fineweb-edu": 0.08,
+    "fineweb2-hq": 0.08,
+    "climbmix": 0.10,
+    "finewiki": 0.15
+  }
+}

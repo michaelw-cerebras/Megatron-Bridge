@@ -1,22 +1,13 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import argparse
+import inspect
 import json
 from pathlib import Path
+from unittest.mock import patch
 
-from megatron.bridge.recipes.gpt_oss.gpt_oss import gpt_oss_20b_pretrain_config
+from megatron.bridge import AutoBridge
+from megatron.bridge.recipes.gpt_oss import gpt_oss as gpt_oss_recipe
+from megatron.bridge.training.callbacks import CallbackContext, CallbackManager
+from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.gpt_step import forward_step
 from megatron.bridge.training.pretrain import pretrain
 
@@ -31,6 +22,26 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be nonnegative")
+    return parsed
+
+
+def _build_gpt_oss_20b_config(hf_model: str) -> ConfigContainer:
+    """Build an offline GPT-OSS config across old and new recipe APIs."""
+    recipe = gpt_oss_recipe.gpt_oss_20b_pretrain_config
+    if "hf_model_id" in inspect.signature(recipe).parameters:
+        return recipe(hf_model_id=hf_model)
+
+    # Megatron Bridge v0.5.0 hard-codes the online model ID in its no-argument
+    # recipe. Redirect only that lookup to the already available local config.
+    local_bridge = AutoBridge.from_hf_pretrained(hf_model)
+    with patch.object(gpt_oss_recipe.AutoBridge, "from_hf_pretrained", return_value=local_bridge):
+        return recipe()
+
+
 def parse_args() -> argparse.Namespace:
     """Parse GPT-OSS continual-pretraining arguments."""
     parser = argparse.ArgumentParser(description="Continue pretraining GPT-OSS 20B on Megatron indexed data.")
@@ -39,11 +50,16 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Local Hugging Face directory containing the GPT-OSS config.json.",
     )
-    parser.add_argument(
+    checkpoint_source = parser.add_mutually_exclusive_group(required=True)
+    checkpoint_source.add_argument(
         "--pretrained-checkpoint",
-        required=True,
         type=Path,
-        help="Imported Megatron checkpoint directory used to initialize model weights.",
+        help="Imported model-only Megatron checkpoint used for a fresh continual-pretraining run.",
+    )
+    checkpoint_source.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        help="Training checkpoint directory used to restore model, optimizer, RNG, and iteration state.",
     )
     parser.add_argument(
         "--dataset-root",
@@ -67,6 +83,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument("--lr-warmup-iters", type=_nonnegative_int, default=0)
+    parser.add_argument("--eval-interval", type=_positive_int)
+    parser.add_argument("--eval-iters", type=_positive_int, default=20)
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Skip training and evaluate the loaded checkpoint at iteration 0.",
+    )
+    parser.add_argument("--log-interval", type=_positive_int, default=1)
+    parser.add_argument(
+        "--tensorboard-dir",
+        type=Path,
+        help="Optional TensorBoard event directory. Prefer node-local storage for long runs.",
+    )
     parser.add_argument(
         "--no-full-recompute",
         action="store_true",
@@ -121,14 +151,46 @@ def load_dataset(dataset_root: Path, max_shards: int | None) -> tuple[list[str],
     return prefixes, int(tokenizer["eos_id"])
 
 
+def _write_eval_only_metrics_to_tensorboard(context: CallbackContext) -> None:
+    """Write eval-only validation metrics that Bridge otherwise omits from TensorBoard."""
+    writer = context.state.tensorboard_logger
+    if writer is None or context.total_loss_dict is None:
+        return
+
+    for key, value in context.total_loss_dict.items():
+        writer.add_scalar(f"{key} validation", value.item(), context.state.train_state.step)
+        writer.add_scalar(
+            f"{key} validation vs samples",
+            value.item(),
+            context.state.train_state.consumed_train_samples,
+        )
+    writer.flush()
+
+
 def main() -> None:
     """Load GPT-OSS 20B weights and continue pretraining on indexed data."""
     args = parse_args()
-    pretrained_checkpoint = args.pretrained_checkpoint.expanduser().resolve()
-    if not pretrained_checkpoint.is_dir():
-        raise FileNotFoundError(pretrained_checkpoint)
+    if args.min_lr > args.lr:
+        raise ValueError("--min-lr must not exceed --lr")
+    if args.lr_warmup_iters >= args.train_iters:
+        raise ValueError("--lr-warmup-iters must be smaller than --train-iters")
 
-    cfg = gpt_oss_20b_pretrain_config(hf_model_id=args.hf_model)
+    pretrained_checkpoint = None
+    if args.pretrained_checkpoint is not None:
+        pretrained_checkpoint = args.pretrained_checkpoint.expanduser().resolve()
+        if not pretrained_checkpoint.is_dir():
+            raise FileNotFoundError(pretrained_checkpoint)
+
+    resume_checkpoint = None
+    if args.resume_checkpoint is not None:
+        resume_checkpoint = args.resume_checkpoint.expanduser().resolve()
+        if not resume_checkpoint.is_dir():
+            raise FileNotFoundError(resume_checkpoint)
+        tracker = resume_checkpoint / "latest_checkpointed_iteration.txt"
+        if not tracker.is_file():
+            raise FileNotFoundError(f"Resume checkpoint has no tracker file: {tracker}")
+
+    cfg = _build_gpt_oss_20b_config(args.hf_model)
 
     # Full GPT-OSS 20B architecture from config.json with single-node MoE parallelism.
     cfg.model.tensor_model_parallel_size = args.tensor_parallel
@@ -150,33 +212,55 @@ def main() -> None:
     cfg.tokenizer.vocab_size = cfg.model.vocab_size
     cfg.tokenizer.null_tokenizer_eod_id = eos_id
 
-    # Initialize from imported model-only weights and create fresh optimizer/RNG state.
-    cfg.checkpoint.pretrained_checkpoint = str(pretrained_checkpoint)
-    cfg.checkpoint.load = None
-    cfg.checkpoint.load_optim = False
-    cfg.checkpoint.load_rng = False
-    cfg.checkpoint.finetune = True
+    if resume_checkpoint is None:
+        # Initialize from imported model-only weights and create fresh optimizer/RNG state.
+        assert pretrained_checkpoint is not None
+        cfg.checkpoint.pretrained_checkpoint = str(pretrained_checkpoint)
+        cfg.checkpoint.load = None
+        cfg.checkpoint.load_optim = False
+        cfg.checkpoint.load_rng = False
+        cfg.checkpoint.finetune = True
+    else:
+        # Continue the same training run, including optimizer, scheduler, RNG, and consumed samples.
+        cfg.checkpoint.pretrained_checkpoint = None
+        cfg.checkpoint.load = str(resume_checkpoint)
+        cfg.checkpoint.load_optim = True
+        cfg.checkpoint.load_rng = True
+        cfg.checkpoint.finetune = False
     cfg.checkpoint.async_save = False
-    if args.save_dir is None:
+
+    save_dir = args.save_dir
+    if save_dir is None and resume_checkpoint is not None:
+        save_dir = resume_checkpoint
+    if save_dir is None:
         cfg.checkpoint.save = None
         cfg.checkpoint.save_interval = None
     else:
-        cfg.checkpoint.save = str(args.save_dir.expanduser().resolve())
+        cfg.checkpoint.save = str(save_dir.expanduser().resolve())
         cfg.checkpoint.save_interval = args.save_interval or args.train_iters
 
     cfg.train.train_iters = args.train_iters
     cfg.train.micro_batch_size = args.micro_batch_size
     cfg.train.global_batch_size = args.global_batch_size
-    cfg.validation.eval_interval = None
-    cfg.validation.eval_iters = 0
-    cfg.logger.log_interval = 1
+    cfg.validation.eval_interval = args.eval_interval
+    cfg.validation.eval_iters = args.eval_iters if args.eval_interval is not None or args.eval_only else 0
+    cfg.validation.skip_train = args.eval_only
+    cfg.logger.log_interval = args.log_interval
+    cfg.logger.tensorboard_log_interval = args.log_interval
+    if args.tensorboard_dir is not None:
+        cfg.logger.tensorboard_dir = str(args.tensorboard_dir.expanduser().resolve())
 
     cfg.optimizer.lr = args.lr
     cfg.optimizer.min_lr = args.min_lr
-    cfg.scheduler.lr_warmup_iters = 0
+    cfg.scheduler.lr_warmup_iters = args.lr_warmup_iters
     cfg.scheduler.lr_decay_iters = args.train_iters
 
-    pretrain(config=cfg, forward_step_func=forward_step)
+    callbacks = None
+    if args.eval_only:
+        callbacks = CallbackManager()
+        callbacks.register("on_eval_end", _write_eval_only_metrics_to_tensorboard)
+
+    pretrain(config=cfg, forward_step_func=forward_step, callbacks=callbacks)
 
 
 if __name__ == "__main__":

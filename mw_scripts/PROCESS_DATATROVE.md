@@ -97,7 +97,7 @@ the effective worker count is reduced. Re-sharding the input is required to obta
 
 For Megatron training, each pair under `data/` is a valid mmap indexed-dataset prefix. `data_prefixes.txt` lists
 all prefixes relative to the output directory, so the complete directory can be moved without rewriting the list.
-For example, the corresponding `mini_gpt_oss.py` setup can load the paths with:
+For example, the corresponding `mini_gptoss.py` setup can load the paths with:
 
 ```python
 from pathlib import Path
