@@ -7,6 +7,7 @@ except ModuleNotFoundError:
 
 if HAVE_MEGATRON_BRIDGE:
     from .gpt_oss_llm_pretrain import (
+        gpt_oss_20b_pretrain_config_b200,
         gpt_oss_20b_pretrain_config_b300,
         gpt_oss_20b_pretrain_config_gb200,
         gpt_oss_20b_pretrain_config_gb300,
@@ -20,6 +21,8 @@ if HAVE_MEGATRON_BRIDGE:
     )
 
 from .gpt_oss_workload_base_configs import (
+    GPT_OSS_20B_PRETRAIN_CONFIG_B200_FP8_MX_V1,
+    GPT_OSS_20B_PRETRAIN_CONFIG_B200_NVFP4_V1,
     GPT_OSS_20B_PRETRAIN_CONFIG_B300_FP8_MX_V1,
     GPT_OSS_20B_PRETRAIN_CONFIG_B300_FP8_MX_V2,
     GPT_OSS_20B_PRETRAIN_CONFIG_B300_NVFP4_V1,
@@ -64,6 +67,8 @@ from .gpt_oss_workload_base_configs import (
 
 __all__ = [
     # 20B
+    "GPT_OSS_20B_PRETRAIN_CONFIG_B200_NVFP4_V1",
+    "GPT_OSS_20B_PRETRAIN_CONFIG_B200_FP8_MX_V1",
     "GPT_OSS_20B_PRETRAIN_CONFIG_B300_NVFP4_V1",
     "GPT_OSS_20B_PRETRAIN_CONFIG_B300_FP8_MX_V1",
     "GPT_OSS_20B_PRETRAIN_CONFIG_GB200_NVFP4_V1",
@@ -110,6 +115,7 @@ __all__ = [
 if HAVE_MEGATRON_BRIDGE:
     __all__.extend(
         [
+            "gpt_oss_20b_pretrain_config_b200",
             "gpt_oss_20b_pretrain_config_b300",
             "gpt_oss_20b_pretrain_config_gb200",
             "gpt_oss_20b_pretrain_config_gb300",

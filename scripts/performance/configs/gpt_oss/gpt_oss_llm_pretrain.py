@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 
 from utils.overrides import set_workload_base_configs
 from utils.precision import get_precision_config
@@ -115,6 +116,62 @@ def get_gpt_oss_20b_precision_config(compute_dtype: str):
         precision_config.num_layers_at_start_in_bf16 = 0
         precision_config.num_layers_at_end_in_bf16 = 4
     return precision_config
+
+
+def gpt_oss_20b_pretrain_config_b200(
+    precision: str = "fp8_mx", mock: bool = True, config_variant: str = "v1"
+) -> ConfigContainer:
+    """Return the 8-GPU B200 GPT-OSS 20B performance configuration."""
+    base_cfg = get_workload_base_config(
+        model_family_name="gpt_oss",
+        model_recipe_name="gpt_oss_20b",
+        gpu="b200",
+        compute_dtype=precision.upper(),
+        task="pretrain",
+        config_variant=config_variant,
+    )
+    hf_model_id = os.getenv("GPT_OSS_20B_HF_MODEL", "openai/gpt-oss-20b")
+    cfg = gpt_oss_20b_pretrain_config(hf_model_id=hf_model_id)
+    set_workload_base_configs(cfg, base_cfg)
+    cfg.mixed_precision = get_gpt_oss_20b_precision_config(precision)
+    if base_cfg.moe_flex_dispatcher_backend is not None:
+        apply_flex_dispatcher_backend(cfg.model, base_cfg.moe_flex_dispatcher_backend)
+    set_gpt_oss_20b_common_configs(cfg)
+
+    if precision == "nvfp4" and config_variant == "v1":
+        cfg.model.cuda_graph_impl = "transformer_engine"
+        cfg.model.cuda_graph_scope = ["attn", "moe_router", "moe_preprocess"]
+        cfg.optimizer.lr = 0.0006
+        cfg.optimizer.min_lr = 0.0006
+        cfg.validation.eval_interval = 768
+        cfg.validation.eval_iters = 64
+        cfg.scheduler.lr_warmup_iters = 128
+    elif precision == "fp8_mx" and config_variant == "v1":
+        # Preserve the published 8-GPU workload shape while selecting B200
+        # explicitly and configuring its NVL8 topology in the launcher.
+        cfg.model.cuda_graph_impl = "local"
+        cfg.model.cuda_graph_modules = "full_iteration"
+        cfg.model.cuda_graph_scope = None
+        cfg.model.use_transformer_engine_op_fuser = True
+        cfg.model.moe_expert_rank_capacity_factor = 1.2
+        cfg.model.moe_mlp_glu_interleave_size = 32
+        cfg.model.cuda_graph_warmup_steps = 5
+        cfg.ddp.average_in_collective = True
+        cfg.ddp.overlap_param_gather = True
+        cfg.optimizer.overlap_param_gather = True
+        cfg.optimizer.lr = 0.0004
+        cfg.optimizer.min_lr = 0.0004
+        cfg.validation.eval_interval = 768
+        cfg.validation.eval_iters = 64
+        cfg.scheduler.lr_warmup_iters = 128
+        cfg.mixed_precision.fp8_param_gather = True
+        cfg.mixed_precision.reuse_grad_buf_for_mxfp8_param_ag = True
+    else:
+        raise ValueError(
+            f"Unsupported GPT-OSS 20B B200 performance configuration: {precision=}, {config_variant=}"
+        )
+
+    return cfg
 
 
 def gpt_oss_20b_pretrain_config_b300(

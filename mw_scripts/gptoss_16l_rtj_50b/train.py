@@ -23,7 +23,10 @@ import math
 import os
 from pathlib import Path
 
+from megatron.bridge.training.comm_overlap import CommOverlapConfig
+from megatron.bridge.training.config import runtime_config_update
 from megatron.bridge.training.gpt_step import forward_step
+from megatron.bridge.training.mixed_precision import get_mixed_precision_config
 from megatron.bridge.training.pretrain import pretrain
 from mw_scripts.mini_gptoss import (
     GPT_OSS_PAD_TOKEN_ID,
@@ -89,11 +92,70 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable the full activation recomputation enabled by default.",
     )
+    parser.add_argument(
+        "--b200-optimized",
+        action="store_true",
+        help=(
+            "Enable the semantics-preserving B200 optimization profile: FP8, DeepEP, "
+            "TE-scoped CUDA graphs, fused operators, and reduced-precision gradient reduction."
+        ),
+    )
+    parser.add_argument(
+        "--deepep-num-sms",
+        type=_positive_int,
+        default=32,
+        help="Number of B200 SMs assigned to the DeepEP flex dispatcher.",
+    )
+    parser.add_argument(
+        "--disable-te-cuda-graphs",
+        action="store_true",
+        help="Disable the TE-scoped graphs in the B200 profile for an A/B throughput comparison.",
+    )
+    parser.add_argument(
+        "--disable-deepep",
+        action="store_true",
+        help="Keep the standard all-to-all dispatcher while testing the remaining B200 optimizations.",
+    )
+    parser.add_argument(
+        "--disable-te-op-fuser",
+        action="store_true",
+        help="Disable the Transformer Engine operation fuser for an A/B throughput comparison.",
+    )
+    parser.add_argument(
+        "--enable-ep-overlap",
+        action="store_true",
+        help="Enable expert-parallel dispatch/combine overlap without delayed wgrad compute.",
+    )
+    parser.add_argument(
+        "--enable-moe-permute-fusion",
+        action="store_true",
+        help="Enable the MoE permute fusion for an isolated performance comparison.",
+    )
+    parser.add_argument(
+        "--force-router-load-balancing",
+        action="store_true",
+        help=(
+            "Force balanced expert routing for a performance-only benchmark. "
+            "This provides static MXFP8 expert-GEMM tile shapes, but changes "
+            "the training router behavior and is therefore disabled by default."
+        ),
+    )
     parser.add_argument("--save-dir", required=True, type=Path)
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--save-interval", type=_positive_int, default=5000)
+    parser.add_argument(
+        "--disable-checkpointing",
+        action="store_true",
+        help="Disable periodic and final checkpoint saves; intended for throughput benchmarks.",
+    )
     parser.add_argument("--tensorboard-dir", required=True, type=Path)
     parser.add_argument("--log-interval", type=_positive_int, default=10)
+    parser.add_argument("--config-output", type=Path)
+    parser.add_argument(
+        "--dryrun",
+        action="store_true",
+        help="Build and optionally save the resolved config without starting training.",
+    )
     return parser.parse_args()
 
 
@@ -145,7 +207,7 @@ def _load_data_args(dataset_root: Path, data_args_path: Path) -> tuple[list[str]
 
 def _validate_parallelism(args: argparse.Namespace) -> None:
     """Validate the configured parallel dimensions against torchrun's world size."""
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    world_size = int(os.environ.get("WORLD_SIZE", "8"))
     dense_model_parallel = args.tensor_parallel * args.pipeline_parallel
     if world_size % dense_model_parallel:
         raise ValueError(f"WORLD_SIZE={world_size} must be divisible by TP*PP={dense_model_parallel}")
@@ -172,6 +234,16 @@ def main() -> None:
         raise ValueError("--lr must be positive")
     if args.min_lr < 0 or args.min_lr > args.lr:
         raise ValueError("--min-lr must be nonnegative and must not exceed --lr")
+    if args.b200_optimized and args.precision == "bf16":
+        raise ValueError("--b200-optimized requires an FP8 precision mode")
+    if args.b200_optimized and not args.no_full_recompute:
+        raise ValueError("--b200-optimized requires --no-full-recompute")
+    if args.enable_ep_overlap and not args.no_full_recompute:
+        raise ValueError("--enable-ep-overlap requires --no-full-recompute")
+    if args.enable_ep_overlap and args.expert_parallel == 1:
+        raise ValueError("--enable-ep-overlap requires --expert-parallel greater than one")
+    if args.disable_checkpointing and args.resume_checkpoint is not None:
+        raise ValueError("--disable-checkpointing cannot be combined with --resume-checkpoint")
 
     tokens_per_iteration = args.seq_length * args.global_batch_size
     train_iters = math.ceil(args.train_tokens / tokens_per_iteration)
@@ -249,6 +321,72 @@ def main() -> None:
         cfg.model.recompute_method = "uniform"
         cfg.model.recompute_num_layers = 1
 
+    if args.b200_optimized:
+        # Keep the custom architecture and routing objective unchanged while
+        # adopting the graph-safe parts of the official B200 performance stack.
+        # DeepEP is the recommended flex backend for a standalone B200 node;
+        # HybridEP is intended primarily for GB200/GB300 NVL systems.
+        cfg.mixed_precision = get_mixed_precision_config(cfg.mixed_precision)
+        if not args.disable_deepep:
+            cfg.model.moe_token_dispatcher_type = "flex"
+            cfg.model.moe_flex_dispatcher_backend = "deepep"
+            cfg.model.moe_deepep_num_sms = args.deepep_num_sms
+        else:
+            # ``--disable-deepep`` is the correctness/performance A/B path,
+            # so select the documented standard dispatcher explicitly instead
+            # of inheriting an incidental recipe default.
+            cfg.model.moe_token_dispatcher_type = "alltoall"
+            cfg.model.moe_flex_dispatcher_backend = None
+        cfg.model.moe_permute_fusion = args.enable_moe_permute_fusion
+        if not args.disable_te_cuda_graphs:
+            cfg.model.cuda_graph_impl = "transformer_engine"
+            # Standard all-to-all preprocess performs host synchronization,
+            # which MCore cannot capture.  DeepEP supports the wider MoE scope.
+            cfg.model.cuda_graph_scope = (
+                ["attn", "moe_router"]
+                if args.disable_deepep
+                else ["attn", "moe_router", "moe_preprocess"]
+            )
+        cfg.model.cuda_graph_warmup_steps = 3
+        cfg.model.use_te_rng_tracker = True
+        cfg.rng.te_rng_tracker = True
+        cfg.model.use_transformer_engine_op_fuser = not args.disable_te_op_fuser
+        # The custom 16L spec uses attention bias, YARN RoPE, and GQA. That
+        # combination is not supported by MCore's fused single-QKV-RoPE path.
+        cfg.model.fused_single_qkv_rope = False
+        cfg.model.calculate_per_token_loss = False
+        cfg.model.moe_mlp_glu_interleave_size = 32
+
+        if args.precision == "mxfp8":
+            cfg.mixed_precision.grad_reduce_in_fp32 = False
+            cfg.mixed_precision.fp8_param_gather = True
+            cfg.mixed_precision.reuse_grad_buf_for_mxfp8_param_ag = True
+        cfg.ddp.grad_reduce_in_fp32 = False
+        cfg.ddp.check_for_nan_in_grad = False
+        cfg.ddp.average_in_collective = True
+        cfg.ddp.bucket_size = 768_000_000
+        cfg.ddp.data_parallel_sharding_strategy = "optim_grads_params"
+        cfg.ddp.fsdp_double_buffer = True
+        cfg.train.check_optimizer_step_success = False
+
+    if args.enable_ep_overlap:
+        # Delay-wgrad is intentionally left off: this model retains attention
+        # bias, which is incompatible with delay-wgrad and TE attention graphs.
+        # The base GPT-OSS recipe leaves this optional section unset, so create
+        # it only for the explicit EP-overlap experiment.
+        cfg.comm_overlap = CommOverlapConfig(tp_comm_overlap=False)
+        cfg.comm_overlap.overlap_moe_expert_parallel_comm = True
+        cfg.comm_overlap.delay_wgrad_compute = False
+        cfg.model.moe_shared_expert_overlap = False
+
+    if args.force_router_load_balancing:
+        # Dynamic dropless routing can produce an expert-token dimension that
+        # is not divisible by MXFP8's 32-element block size.  This benchmark
+        # mode gives each expert a fixed token count, making the expert GEMM
+        # shapes MXFP8-compatible.  Keep it opt-in: it is not equivalent to
+        # the normal aux-loss router used for convergence training.
+        cfg.model.moe_router_force_load_balancing = True
+
     cfg.model.seq_length = args.seq_length
     cfg.dataset.sequence_length = args.seq_length
     cfg.dataset.data_path = data_args
@@ -283,9 +421,14 @@ def main() -> None:
     cfg.logger.tensorboard_log_interval = args.log_interval
     cfg.logger.log_timers_to_tensorboard = True
     cfg.logger.log_throughput_to_tensorboard = True
+    if args.config_output is not None:
+        config_output = args.config_output.expanduser().resolve()
+        cfg.logger.save_config_filepath = str(config_output)
 
     cfg.checkpoint.pretrained_checkpoint = None
-    cfg.checkpoint.save = str(save_dir)
+    # MCore otherwise saves a checkpoint after the final benchmark iteration,
+    # which measures storage performance rather than training throughput.
+    cfg.checkpoint.save = None if args.disable_checkpointing else str(save_dir)
     cfg.checkpoint.save_interval = args.save_interval
     cfg.checkpoint.ckpt_format = "torch_dist"
     cfg.checkpoint.fully_parallel_save = True
@@ -313,8 +456,22 @@ def main() -> None:
             args.precision,
             resume_checkpoint is not None,
         )
-        LOGGER.info("Checkpoint directory: %s", save_dir)
+        LOGGER.info(
+            "Checkpointing: %s (directory: %s)",
+            "disabled" if args.disable_checkpointing else "enabled",
+            save_dir,
+        )
         LOGGER.info("TensorBoard directory: %s", tensorboard_dir)
+
+    if args.dryrun:
+        runtime_config_update(cfg)
+        if args.config_output is not None:
+            config_output.parent.mkdir(parents=True, exist_ok=True)
+            cfg.to_yaml(config_output)
+            LOGGER.info("Dry-run ConfigContainer saved to %s", config_output)
+        else:
+            LOGGER.info("Dry-run config built successfully")
+        return
 
     pretrain(config=cfg, forward_step_func=forward_step)
 

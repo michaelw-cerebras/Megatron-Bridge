@@ -51,6 +51,17 @@ BASE_GPT_OSS_120B_CONFIG = WorkloadBaseConfig(
 # GPT-OSS 20B Pretrain
 # =============================================================================
 
+GPT_OSS_20B_PRETRAIN_CONFIG_B200_NVFP4_V1 = replace(
+    BASE_GPT_OSS_20B_CONFIG,
+    expert_model_parallel_size=2,
+    moe_flex_dispatcher_backend="hybridep",
+)
+
+GPT_OSS_20B_PRETRAIN_CONFIG_B200_FP8_MX_V1 = replace(
+    BASE_GPT_OSS_20B_CONFIG,
+    moe_flex_dispatcher_backend="hybridep",
+)
+
 GPT_OSS_20B_PRETRAIN_CONFIG_B300_NVFP4_V1 = replace(
     BASE_GPT_OSS_20B_CONFIG,
     expert_model_parallel_size=2,
@@ -229,6 +240,8 @@ GPT_OSS_120B_PRETRAIN_CONFIG_VR200_FP8_MX_V2 = GPT_OSS_120B_PRETRAIN_CONFIG_GB20
 
 __all__ = [
     # 20B
+    "GPT_OSS_20B_PRETRAIN_CONFIG_B200_NVFP4_V1",
+    "GPT_OSS_20B_PRETRAIN_CONFIG_B200_FP8_MX_V1",
     "GPT_OSS_20B_PRETRAIN_CONFIG_B300_NVFP4_V1",
     "GPT_OSS_20B_PRETRAIN_CONFIG_B300_FP8_MX_V1",
     "GPT_OSS_20B_PRETRAIN_CONFIG_B300_NVFP4_V2",

@@ -31,7 +31,7 @@ from megatron.bridge.training.utils.omegaconf_utils import (
     create_omegaconf_dict_config,
     parse_hydra_overrides,
 )
-from megatron.bridge.utils.cuda_graph import is_full_iteration_cuda_graph
+from megatron.bridge.utils.cuda_graph import clear_cuda_graph_modules, is_full_iteration_cuda_graph
 from utils.datasets import (
     create_c4_dataset_config,
     create_mock_dataset_config,
@@ -115,6 +115,14 @@ def _set_cuda_graph_overrides(
         if cuda_graph_impl != "none":
             recipe.rng.te_rng_tracker = recipe.model.use_te_rng_tracker = True
 
+    # A recipe can default to the current MCore ``cuda_graph_modules`` API
+    # (for example, ``full_iteration``).  TE-scoped capture instead uses the
+    # legacy ``cuda_graph_scope`` field, and MCore rejects configurations that
+    # set both representations.  Clear the recipe's module setting before
+    # applying a requested TE scope.
+    if recipe.model.cuda_graph_impl == "transformer_engine":
+        clear_cuda_graph_modules(recipe.model)
+
     if cuda_graph_scope is not None:
         recipe.model.cuda_graph_scope = cuda_graph_scope
 
@@ -127,7 +135,7 @@ def _set_cuda_graph_overrides(
             f"Invalid cuda graph scope: {effective_scope}. Valid options are: {valid_te_scopes}"
         )
     elif recipe.model.cuda_graph_impl == "none":
-        recipe.model.cuda_graph_scope = []
+        clear_cuda_graph_modules(recipe.model)
         recipe.rng.te_rng_tracker = recipe.model.use_te_rng_tracker = False
 
     if is_full_iteration_cuda_graph(recipe.model):

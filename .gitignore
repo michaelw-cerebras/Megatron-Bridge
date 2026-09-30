@@ -185,3 +185,4 @@ slurm*.out
 
 # UV package manager
 .uv/
+training_logs/

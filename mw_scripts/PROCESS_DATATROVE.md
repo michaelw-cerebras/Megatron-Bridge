@@ -1,8 +1,8 @@
 # Production Hugging Face → Megatron preprocessing
 
-`process_datatrove.py` streams Parquet shards directly from a Hugging Face dataset repository and writes
-Megatron mmap indexed datasets (`.bin` + `.idx`). It does not create JSONL and does not download the source
-Parquet corpus into the output directory.
+`process_datatrove.py` streams local or Hugging Face shards and writes Megatron mmap indexed datasets
+(`.bin` + `.idx`). It does not create JSONL or copy the source corpus into the output directory. Hugging Face
+inputs support Parquet; local inputs support Parquet, JSONL, `jsonl.gz`, and line-delimited `json.gz`.
 
 The script is intended for datasets whose documents live in a `text` column. It reads only that column by default
 and generates stable IDs from the source file path and row number. IDs do not alter the tokenized Megatron output.
@@ -11,6 +11,8 @@ and generates stable IDs from the source file path and row number. IDs do not al
 
 Use the same DataTrove 0.9.0 environment as the throughput benchmark. The required packages are DataTrove,
 PyArrow, Hugging Face Hub, fsspec, and tokenizers. Private datasets use the normal `HF_TOKEN` environment variable.
+For air-gapped local input, pass a local tokenizer directory or `tokenizer.json` to `--tokenizer`; no Hub request is
+made when that path exists.
 
 ## Process an entire dataset repository
 
@@ -25,6 +27,20 @@ python mw_scripts/process_datatrove.py \
 
 The default tokenizer is `openai/gpt-oss-20b`, and the default end-of-document token is `<|return|>`.
 The script resolves both `main` revisions to immutable commit SHAs before processing.
+
+## Process local files
+
+Local Parquet and compressed JSONL are read in place:
+
+```bash
+python mw_scripts/process_datatrove.py \
+  --input-folder /path/to/local/dataset \
+  --path-glob '*.jsonl.gz' \
+  --output-folder /path/to/tokenized/dataset \
+  --workers 96
+```
+
+Each invocation must select one input format. Use separate output folders when a corpus mixes Parquet and JSONL.
 
 ## Select one or more configs
 

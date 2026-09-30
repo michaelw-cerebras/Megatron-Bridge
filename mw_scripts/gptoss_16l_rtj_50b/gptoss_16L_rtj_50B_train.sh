@@ -31,6 +31,8 @@ Usage:
   mw_scripts/gptoss_16l_rtj_50b/gptoss_16L_rtj_50B_train.sh              # background (default)
   mw_scripts/gptoss_16l_rtj_50b/gptoss_16L_rtj_50B_train.sh --foreground
   mw_scripts/gptoss_16l_rtj_50b/gptoss_16L_rtj_50B_train.sh --status
+  mw_scripts/gptoss_16l_rtj_50b/gptoss_16L_rtj_50B_train.sh --preflight
+  mw_scripts/gptoss_16l_rtj_50b/gptoss_16L_rtj_50B_train.sh --dryrun
 
 The default run uses 8 GPUs, sequence length 8192, GBS 128, EP 8, FP8 current
 scaling, full activation recomputation, and the checked-in RTJ source mix.
@@ -41,6 +43,10 @@ Set environment variables below before launch to override defaults:
   TRAIN_TOKENS, SEQ_LENGTH, MICRO_BATCH_SIZE, GLOBAL_BATCH_SIZE
   TENSOR_PARALLEL, PIPELINE_PARALLEL, EXPERT_PARALLEL
   EXPERT_TENSOR_PARALLEL, PRECISION, NO_FULL_RECOMPUTE
+  B200_OPTIMIZED, DEEP_EP_NUM_SMS, DISABLE_TE_CUDA_GRAPHS, DISABLE_DEEPEP
+  DISABLE_TE_OP_FUSER, ENABLE_EP_OVERLAP, ENABLE_MOE_PERMUTE_FUSION
+  FORCE_ROUTER_LOAD_BALANCING (performance-only; default: 0)
+  DISABLE_CHECKPOINTING
   LR, MIN_LR, LR_WARMUP_ITERS, SAVE_INTERVAL, LOG_INTERVAL, NUM_WORKERS
 EOF
 }
@@ -50,6 +56,8 @@ case "${1:-}" in
   "") ;;
   --foreground) action="foreground" ;;
   --status) action="status" ;;
+  --preflight) action="preflight" ;;
+  --dryrun) action="dryrun" ;;
   -h|--help)
     usage
     exit 0
@@ -82,6 +90,7 @@ DATA_ARGS_PATH="$METADATA_DIR/megatron_data_args.txt"
 RESOLVED_MIXTURE_PATH="$METADATA_DIR/resolved_mixture.json"
 MIXTURE_SNAPSHOT_PATH="$METADATA_DIR/mixture_config.json"
 RUN_CONFIG_PATH="$METADATA_DIR/launch_config.env"
+CONFIG_OUTPUT="$METADATA_DIR/ConfigContainer.yaml"
 PID_FILE="${PID_FILE:-$RUN_DIR/train.pid}"
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -95,6 +104,15 @@ EXPERT_PARALLEL="${EXPERT_PARALLEL:-8}"
 EXPERT_TENSOR_PARALLEL="${EXPERT_TENSOR_PARALLEL:-1}"
 PRECISION="${PRECISION:-fp8-current}"
 NO_FULL_RECOMPUTE="${NO_FULL_RECOMPUTE:-0}"
+B200_OPTIMIZED="${B200_OPTIMIZED:-0}"
+DEEP_EP_NUM_SMS="${DEEP_EP_NUM_SMS:-32}"
+DISABLE_TE_CUDA_GRAPHS="${DISABLE_TE_CUDA_GRAPHS:-0}"
+DISABLE_DEEPEP="${DISABLE_DEEPEP:-0}"
+DISABLE_TE_OP_FUSER="${DISABLE_TE_OP_FUSER:-0}"
+ENABLE_EP_OVERLAP="${ENABLE_EP_OVERLAP:-0}"
+ENABLE_MOE_PERMUTE_FUSION="${ENABLE_MOE_PERMUTE_FUSION:-0}"
+FORCE_ROUTER_LOAD_BALANCING="${FORCE_ROUTER_LOAD_BALANCING:-0}"
+DISABLE_CHECKPOINTING="${DISABLE_CHECKPOINTING:-0}"
 LR="${LR:-3e-4}"
 MIN_LR="${MIN_LR:-3e-5}"
 LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-1000}"
@@ -167,6 +185,7 @@ for numeric_value in \
   "$PIPELINE_PARALLEL" \
   "$EXPERT_PARALLEL" \
   "$EXPERT_TENSOR_PARALLEL" \
+  "$DEEP_EP_NUM_SMS" \
   "$LR_WARMUP_ITERS" \
   "$SAVE_INTERVAL" \
   "$LOG_INTERVAL" \
@@ -186,8 +205,18 @@ if ((
   echo "STOP: GPU, token, batch, parallelism, save, and log values must be positive." >&2
   exit 2
 fi
-if [[ "$NO_FULL_RECOMPUTE" != 0 && "$NO_FULL_RECOMPUTE" != 1 ]]; then
-  echo "STOP: NO_FULL_RECOMPUTE must be 0 or 1." >&2
+for boolean_value in "$NO_FULL_RECOMPUTE" "$B200_OPTIMIZED" "$DISABLE_TE_CUDA_GRAPHS" "$DISABLE_DEEPEP" "$DISABLE_TE_OP_FUSER" "$ENABLE_EP_OVERLAP" "$ENABLE_MOE_PERMUTE_FUSION" "$FORCE_ROUTER_LOAD_BALANCING" "$DISABLE_CHECKPOINTING"; do
+  if [[ "$boolean_value" != 0 && "$boolean_value" != 1 ]]; then
+    echo "STOP: boolean tuning options must be 0 or 1." >&2
+    exit 2
+  fi
+done
+if [[ "$B200_OPTIMIZED" == 1 && "$PRECISION" == "bf16" ]]; then
+  echo "STOP: B200_OPTIMIZED=1 requires PRECISION=fp8-current or PRECISION=mxfp8." >&2
+  exit 2
+fi
+if [[ "$B200_OPTIMIZED" == 1 && "$NO_FULL_RECOMPUTE" != 1 ]]; then
+  echo "STOP: B200_OPTIMIZED=1 requires NO_FULL_RECOMPUTE=1." >&2
   exit 2
 fi
 if [[ ! -f "$GPTOSS_HF_PATH/config.json" ]]; then
@@ -204,17 +233,19 @@ if [[ ! -f "$MIXTURE_CONFIG" ]]; then
 fi
 
 resume_run=0
-if [[ -f "$CHECKPOINT_DIR/latest_checkpointed_iteration.txt" || -f "$CHECKPOINT_DIR/latest_train_state.pt" ]]; then
+if [[ "$DISABLE_CHECKPOINTING" == 0 ]] && [[ -f "$CHECKPOINT_DIR/latest_checkpointed_iteration.txt" || -f "$CHECKPOINT_DIR/latest_train_state.pt" ]]; then
   resume_run=1
 fi
 
-if (( resume_run )); then
-  exec >>"$TRAIN_LOG" 2>&1
-  echo
-  echo "===== RESUME $(date --iso-8601=seconds) ====="
-else
-  exec >"$TRAIN_LOG" 2>&1
-  echo "===== FRESH RANDOM-INIT RUN $(date --iso-8601=seconds) ====="
+if [[ "$action" == "foreground" ]]; then
+  if (( resume_run )); then
+    exec >>"$TRAIN_LOG" 2>&1
+    echo
+    echo "===== RESUME $(date --iso-8601=seconds) ====="
+  else
+    exec >"$TRAIN_LOG" 2>&1
+    echo "===== FRESH RANDOM-INIT RUN $(date --iso-8601=seconds) ====="
+  fi
 fi
 
 mixture_sha256="$(sha256sum "$MIXTURE_CONFIG" | awk '{print $1}')"
@@ -236,6 +267,15 @@ current_run_config="$(mktemp "$METADATA_DIR/.launch_config.XXXXXX")"
   printf 'EXPERT_TENSOR_PARALLEL=%s\n' "$EXPERT_TENSOR_PARALLEL"
   printf 'PRECISION=%s\n' "$PRECISION"
   printf 'NO_FULL_RECOMPUTE=%s\n' "$NO_FULL_RECOMPUTE"
+  printf 'B200_OPTIMIZED=%s\n' "$B200_OPTIMIZED"
+  printf 'DEEP_EP_NUM_SMS=%s\n' "$DEEP_EP_NUM_SMS"
+  printf 'DISABLE_TE_CUDA_GRAPHS=%s\n' "$DISABLE_TE_CUDA_GRAPHS"
+  printf 'DISABLE_DEEPEP=%s\n' "$DISABLE_DEEPEP"
+  printf 'DISABLE_TE_OP_FUSER=%s\n' "$DISABLE_TE_OP_FUSER"
+  printf 'ENABLE_EP_OVERLAP=%s\n' "$ENABLE_EP_OVERLAP"
+  printf 'ENABLE_MOE_PERMUTE_FUSION=%s\n' "$ENABLE_MOE_PERMUTE_FUSION"
+  printf 'FORCE_ROUTER_LOAD_BALANCING=%s\n' "$FORCE_ROUTER_LOAD_BALANCING"
+  printf 'DISABLE_CHECKPOINTING=%s\n' "$DISABLE_CHECKPOINTING"
   printf 'LR=%s\n' "$LR"
   printf 'MIN_LR=%s\n' "$MIN_LR"
   printf 'LR_WARMUP_ITERS=%s\n' "$LR_WARMUP_ITERS"
@@ -284,6 +324,7 @@ echo "TRAIN_TOKENS_REQUESTED: $TRAIN_TOKENS"
 echo "TRAIN_ITERS: $train_iters"
 echo "TRAIN_TOKENS_SCHEDULED: $scheduled_tokens"
 echo "MODE: $([[ "$resume_run" == 1 ]] && echo resume || echo fresh-random-init)"
+echo "CHECKPOINTING: $([[ "$DISABLE_CHECKPOINTING" == 1 ]] && echo disabled-benchmark || echo enabled)"
 echo "WARNING: this 16-layer variant starts from random weights; it does not load the public 24-layer checkpoint."
 
 train_args=(
@@ -309,6 +350,7 @@ train_args=(
   --save-interval "$SAVE_INTERVAL"
   --tensorboard-dir "$TENSORBOARD_DIR"
   --log-interval "$LOG_INTERVAL"
+  --config-output "$CONFIG_OUTPUT"
 )
 if (( resume_run )); then
   train_args+=(--resume-checkpoint "$CHECKPOINT_DIR")
@@ -316,18 +358,90 @@ fi
 if [[ "$NO_FULL_RECOMPUTE" == 1 ]]; then
   train_args+=(--no-full-recompute)
 fi
+if [[ "$B200_OPTIMIZED" == 1 ]]; then
+  train_args+=(--b200-optimized)
+fi
+train_args+=(--deepep-num-sms "$DEEP_EP_NUM_SMS")
+if [[ "$DISABLE_TE_CUDA_GRAPHS" == 1 ]]; then
+  train_args+=(--disable-te-cuda-graphs)
+fi
+if [[ "$DISABLE_DEEPEP" == 1 ]]; then
+  train_args+=(--disable-deepep)
+fi
+if [[ "$DISABLE_TE_OP_FUSER" == 1 ]]; then
+  train_args+=(--disable-te-op-fuser)
+fi
+if [[ "$ENABLE_EP_OVERLAP" == 1 ]]; then
+  train_args+=(--enable-ep-overlap)
+fi
+if [[ "$ENABLE_MOE_PERMUTE_FUSION" == 1 ]]; then
+  train_args+=(--enable-moe-permute-fusion)
+fi
+if [[ "$FORCE_ROUTER_LOAD_BALANCING" == 1 ]]; then
+  train_args+=(--force-router-load-balancing)
+fi
+if [[ "$DISABLE_CHECKPOINTING" == 1 ]]; then
+  train_args+=(--disable-checkpointing)
+fi
 
 export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-CRITICAL}"
 export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore::FutureWarning,ignore::UserWarning}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
+export TORCH_NCCL_AVOID_RECORD_STREAMS="${TORCH_NCCL_AVOID_RECORD_STREAMS:-0}"
+export TORCH_NCCL_HIGH_PRIORITY="${TORCH_NCCL_HIGH_PRIORITY:-1}"
 # NVLS is disabled by default for the current B200 bring-up. Override only after validating the fabric.
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,graph_capture_record_stream_reuse:True}"
 export PYTHONUNBUFFERED=1
+
+if [[ "$B200_OPTIMIZED" == 1 ]]; then
+  uv run --no-sync python - <<'PY'
+from importlib import metadata
+
+import torch
+import transformer_engine as te
+from deep_ep import Buffer  # noqa: F401
+from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
+
+names = [torch.cuda.get_device_name(rank) for rank in range(torch.cuda.device_count())]
+if len(names) != 8 or any("B200" not in name or "GB200" in name for name in names):
+    raise SystemExit(f"Expected exactly 8 NVIDIA B200 GPUs, found: {names}")
+if torch.cuda.get_device_capability(0) != (10, 0):
+    raise SystemExit(f"Expected SM100, found: {torch.cuda.get_device_capability(0)}")
+if not hasattr(te.common.recipe, "MXFP8BlockScaling"):
+    raise SystemExit("Transformer Engine does not provide MXFP8BlockScaling")
+
+print("B200 optimized-profile preflight passed")
+print(f"  GPUs: 8 x {names[0]} (SM100)")
+print(f"  PyTorch: {torch.__version__}; CUDA: {torch.version.cuda}; NCCL: {torch.cuda.nccl.version()}")
+print(f"  Transformer Engine: {te.__version__}; DeepEP: {metadata.version('deep-ep')}")
+PY
+fi
+
+if [[ "$action" == "preflight" ]]; then
+  exit 0
+fi
+
+if [[ "$action" != "dryrun" && "${ALLOW_BUSY_GPUS:-0}" != "1" ]]; then
+  BUSY_GPU_PROCESSES="$(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null || true)"
+  if [[ -n "$BUSY_GPU_PROCESSES" ]]; then
+    echo "Refusing to start because GPU compute processes are already running:" >&2
+    echo "$BUSY_GPU_PROCESSES" >&2
+    echo "Stop the existing training run first, or set ALLOW_BUSY_GPUS=1 intentionally." >&2
+    exit 3
+  fi
+fi
+
+if [[ "$action" == "dryrun" ]]; then
+  WORLD_SIZE="$NPROC_PER_NODE" uv run --no-sync python -m mw_scripts.gptoss_16l_rtj_50b.train "${train_args[@]}" --dryrun
+  exit 0
+fi
 
 set +e
 uv run --no-sync python -m torch.distributed.run \
