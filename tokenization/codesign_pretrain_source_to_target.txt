@@ -1,0 +1,57 @@
+CodeSign pretrain source folder -> tokenized output folder mapping
+Generated: 2026-09-30
+Output root: /cb/ml-olympus/codesign_pretrain/tokenized/mellum2
+Input types: *.parquet, *.jsonl.gz, *.json.gz
+Each row is one tokenization unit. Its file count includes matching files in all
+subdirectories of the listed source folder.
+Output paths omit the puffer_* deduplication wrapper and structural data/ directory.
+finepdfs train/test, Ultra-FineWeb-L3 qa/multi_style, all Legal subsets, and peS2o
+v0/documents are each combined at their listed dataset/subset level.
+Ultra-FineWeb CC-MAIN-* crawl partitions are combined at the named subset level.
+Source .tmp files are excluded; they may indicate unfinished downloads.
+
+Total: 39 tokenization units, 126231 input files.
+Source .tmp files: heuristics_filtered_datasets=192, deduped_datasets=0
+
+[heuristics_filtered_datasets] 20 tokenization units, 60043 input files
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-Code-v1/data  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-Code-v1  (2334 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-Math-v1/3  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-Math-v1/3  (451 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-Math-v1/4plus  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-Math-v1/4plus  (318 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-Math-v1/4plus_MIND  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-Math-v1/4plus_MIND  (626 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2/Diverse-QA  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/Diverse-QA  (5772 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2/High-Quality  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/High-Quality  (5893 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2/High-Quality-Synthetic  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/High-Quality-Synthetic  (13404 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2/Medium-High-Quality  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/Medium-High-Quality  (618 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2/Translated-Diverse-QA  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/Translated-Diverse-QA  (3648 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2.1/High-Quality  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/High-Quality  (205 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2.1/High-Quality-Synthetic  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/High-Quality-Synthetic  (791 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2.1/High-Quality-Translated-To-English  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/High-Quality-Translated-To-English  (354 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2.1/High-Quality-Translated-To-English-Synthetic  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/High-Quality-Translated-To-English-Synthetic  (1332 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2.1/Medium-High-Quality  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/Medium-High-Quality  (12 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2.1/Medium-High-Quality-Synthetic  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/Medium-High-Quality-Synthetic  (2080 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Nemotron-CC-v2.1/Medium-High-Quality-Translated-To-English  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/Medium-High-Quality-Translated-To-English  (27 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Ultra-FineWeb-L3/data/ultrafineweb_en_l3  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Ultra-FineWeb-L3/ultrafineweb_en_l3  (7009 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/Ultra-FineWeb-L3/data/ultrafineweb_zh_l3  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Ultra-FineWeb-L3/ultrafineweb_zh_l3  (3581 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/finepdfs  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/finepdfs  (3372 files)
+/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets/stack-v3-train/data  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/stack-v3-train  (8216 files)
+
+[deduped_datasets] 19 tokenization units, 66188 input files
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Legal-v1  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Legal-v1  (51 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Math-Textbooks  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Math-Textbooks  (142 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-STEM-SFT  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-STEM-SFT  (330 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Scientific-Coding  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Scientific-Coding  (3 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Wiki-Rewrite  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Wiki-Rewrite  (49 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Code-Concepts  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Code-Concepts  (122 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Economics  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Economics  (1 file)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Formal-Logic  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Formal-Logic  (1 file)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Multiple-Choice  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Multiple-Choice  (14 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Fact-Seeking  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Fact-Seeking  (291 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Generative  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Generative  (4 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Moral-Scenarios  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Moral-Scenarios  (1 file)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Multiple-Choice  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Multiple-Choice  (49 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/peS2o  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/peS2o  (102 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/pubmed/data  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/pubmed  (17 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_exact_specialized_v1/uspto  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/uspto  (975 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_minhash_ufw_en_v1_4_p128_b8_lsh_only_v1/Ultra-FineWeb/data/ultrafineweb_en_v1_4  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Ultra-FineWeb/ultrafineweb_en_v1_4  (56320 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_minhash_ufw_en_v1_4_p128_b8_lsh_only_v1/Ultra-FineWeb/data/ultrafineweb_l1_en_hq  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Ultra-FineWeb/ultrafineweb_l1_en_hq  (6000 files)
+/cb/ml-olympus/codesign_pretrain/deduped_datasets/puffer_minhash_ufw_en_v1_4_p128_b8_lsh_only_v1/Ultra-FineWeb/data/ultrafineweb_zh  ->  /cb/ml-olympus/codesign_pretrain/tokenized/mellum2/Ultra-FineWeb/ultrafineweb_zh  (1716 files)

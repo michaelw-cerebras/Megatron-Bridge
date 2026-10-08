@@ -35,6 +35,7 @@ python process_datatrove.py \
 """
 
 import argparse
+import fcntl
 import fnmatch
 import hashlib
 import importlib.metadata
@@ -55,6 +56,8 @@ from typing import BinaryIO
 
 logger = logging.getLogger(__name__)
 INDEX_HEADER = b"MMIDIDX\x00\x00"
+# Keep each task small enough that preempted workers replay fewer source files.
+AUTO_TASKS_PER_WORKER = 8
 STACK_V3_RENDERER_RELATIVE_PATH = "tokenization/stack_v3_repo_to_text_27_variants.py"
 STACK_V3_RENDERER_PATH = Path(__file__).resolve().parents[1] / STACK_V3_RENDERER_RELATIVE_PATH
 DTYPE_ITEM_SIZES = {
@@ -170,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tasks",
         type=int,
-        help="Stable output task/shard count. Defaults to min(input files, 2 * workers).",
+        help="Stable output task/shard count. Defaults to min(input files, 8 * workers).",
     )
     parser.add_argument(
         "--reader-batch-size",
@@ -286,7 +289,11 @@ def derive_execution_shape(*, file_count: int, requested_tasks: int | None, requ
         raise ValueError("--tasks must be positive")
     if requested_tasks is not None and requested_tasks > file_count:
         raise ValueError(f"--tasks={requested_tasks} exceeds the {file_count} selected Parquet files")
-    tasks = requested_tasks if requested_tasks is not None else min(file_count, requested_workers * 2)
+    tasks = (
+        requested_tasks
+        if requested_tasks is not None
+        else min(file_count, requested_workers * AUTO_TASKS_PER_WORKER)
+    )
     workers = min(requested_workers, tasks)
     return tasks, workers
 
@@ -919,8 +926,21 @@ def main() -> None:
     args = parse_args()
     if args.reader_batch_size <= 0 or args.tokenizer_batch_size <= 0:
         raise ValueError("Batch sizes must be positive")
-    manifest = load_resumable_run(args) if args.resume else prepare_new_run(args)
-    run_pipeline(args, manifest)
+    # A sibling lock also covers the interval before the output directory exists.
+    # Lustre flock must be cluster-wide on every client used for this output.
+    lock_path = args.output_folder.parent / f".{args.output_folder.name}.datatrove.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.info("Waiting for DataTrove output lock: %s", args.output_folder)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if not args.resume and (args.output_folder / "manifest.json").is_file():
+            logger.info("Existing run found after acquiring output lock; resuming %s", args.output_folder)
+            args.resume = True
+        manifest = load_resumable_run(args) if args.resume else prepare_new_run(args)
+        run_pipeline(args, manifest)
 
 
 if __name__ == "__main__":

@@ -108,8 +108,10 @@ OUTPUT_FOLDER/
 count. `result.json` is written only after every `.idx` is parsed and every `.bin` size is validated.
 
 Each input Parquet file is assigned to one task. With the default settings, tasks are
-`min(number of Parquet files, 2 × workers)`. If the dataset contains fewer Parquet files than requested workers,
-the effective worker count is reduced. Re-sharding the input is required to obtain more file-level parallelism.
+`min(number of Parquet files, 8 × workers)`, keeping each task shorter so preemption replays less work.
+If the dataset contains fewer Parquet files than requested workers, the effective worker count is reduced.
+Existing runs keep the task count pinned in their manifests; changing that count requires starting a new output.
+Re-sharding the input is required to obtain more file-level parallelism.
 
 For Megatron training, each pair under `data/` is a valid mmap indexed-dataset prefix. `data_prefixes.txt` lists
 all prefixes relative to the output directory, so the complete directory can be moved without rewriting the list.

@@ -60,6 +60,38 @@ def test_large_repository_chunks_are_bounded_and_deterministic() -> None:
     assert all(len(chunk) <= 256 for chunk in first)
 
 
+def test_reader_preserves_documents_across_large_file(tmp_path: Path) -> None:
+    source_path = tmp_path / "part.parquet"
+    rows = [
+        {
+            "repo_path": f"acme/repo-{index}",
+            "files": [{"file_path": "src/main.py", "content": f"value = {index}\n"}],
+        }
+        for index in range(300)
+    ]
+    pq.write_table(pa.Table.from_pylist(rows), source_path)
+    paths_file = tmp_path / "paths.txt"
+    paths_file.write_text("part.parquet\n", encoding="utf-8")
+
+    def read_documents(batch_size: int) -> list[tuple[str, str, int]]:
+        reader = StackV3ParquetReader(
+            data_folder=str(tmp_path),
+            paths_file=str(paths_file),
+            batch_size=batch_size,
+            dataset_name="stack-v3-train",
+            seed=1234,
+            max_chars=256,
+        )
+        return [
+            (document.id, document.text, document.metadata["source_row_index"])
+            for document in reader.read_file("part.parquet")
+        ]
+
+    documents = read_documents(1)
+    assert documents == read_documents(16)
+    assert len(documents) == len(rows)
+
+
 def _write_test_tokenizer(path: Path) -> None:
     tokenizer = Tokenizer(WordLevel({"[UNK]": 0, "<eos>": 1}, unk_token="[UNK]"))
     tokenizer.pre_tokenizer = Whitespace()

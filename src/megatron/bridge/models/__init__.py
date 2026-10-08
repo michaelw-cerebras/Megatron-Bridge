@@ -88,6 +88,7 @@ from megatron.bridge.models.llama_nemotron import (
     LlamaNemotronHeterogeneousProvider,
 )
 from megatron.bridge.models.mamba.mamba_provider import MambaModelProvider
+from megatron.bridge.models.mellum import MellumBridge
 from megatron.bridge.models.mimo.mimo_bridge import MimoBridge
 from megatron.bridge.models.mimo_v2_flash import (
     MiMoV2FlashBridge,
@@ -203,6 +204,7 @@ __all__ = [
     "GLM45VModelProvider",
     "GPTModelProvider",
     "GPTOSSBridge",
+    "MellumBridge",
     "T5ModelProvider",
     "KimiK2Bridge",
     "KimiK25VLModel",

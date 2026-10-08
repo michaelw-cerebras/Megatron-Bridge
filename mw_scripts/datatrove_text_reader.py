@@ -133,6 +133,7 @@ class StackV3ParquetReader(BaseDiskReader):
         Yields:
             DataTrove documents containing rendered repository text.
         """
+        import pyarrow as pa
         import pyarrow.parquet as pq
 
         from tokenization.stack_v3_repo_to_text_27_variants import repo_to_text_chunks, source_row_seed
@@ -140,9 +141,11 @@ class StackV3ParquetReader(BaseDiskReader):
         with self.data_folder.open(filepath, "rb") as input_file:
             with pq.ParquetFile(input_file) as parquet_file:
                 row_number = 0
+                next_memory_release = 256
                 for batch in parquet_file.iter_batches(batch_size=self.batch_size, columns=self.columns):
+                    rows = batch.to_pylist()
                     with self.track_time("batch"):
-                        for row in batch.to_pylist():
+                        for row in rows:
                             chunk_iterator = repo_to_text_chunks(
                                 row,
                                 max_chars=self.max_chars,
@@ -163,6 +166,14 @@ class StackV3ParquetReader(BaseDiskReader):
                                 if document is not None:
                                     yield document
                             row_number += 1
+                    if rows:
+                        del row
+                    del rows, batch
+                    if row_number >= next_memory_release:
+                        # Large nested repository rows leave reusable Arrow pages in the pool.
+                        # Return them before they accumulate across thousands of rows.
+                        pa.default_memory_pool().release_unused()
+                        next_memory_release = row_number + 256
 
 
 class TextJsonlReader(BaseDiskReader):

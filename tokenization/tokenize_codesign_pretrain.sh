@@ -29,30 +29,35 @@ Tokenize the local CodeSign pretraining corpora with DataTrove.
 Usage:
   tokenization/tokenize_codesign_pretrain.sh [--background | --dry-run]
 
-The launcher preserves source subdirectories as independently weighted output
-datasets, skips outputs with a valid completion marker, and resumes incomplete
-DataTrove tasks automatically.
+The launcher processes the reviewed CodeSign source-to-target units, skips
+matching completed outputs, and resumes incomplete DataTrove tasks automatically.
 
 Environment overrides:
-  INPUT_ROOT               Source root
+  HEURISTICS_ROOT          Heuristics-filtered source root
+  DEDUPED_ROOT             Deduplicated source root
   OUTPUT_ROOT              Tokenized output root
   TOKENIZER                Local tokenizer directory/tokenizer.json, or HF ID
   TOKENIZER_REVISION       Tokenizer revision (default: main)
   TOKENIZATION_PYTHON      Python executable from the DataTrove environment
+                           (default: sibling envs/datatrove, then uv)
   DATATROVE_ROOT           Optional local DataTrove checkout; adds its src/ to PYTHONPATH
-  EOS_TOKEN                End-of-document token (default: <|return|>)
-  WORKERS                  Concurrent DataTrove workers (default: available CPUs)
+  EOS_TOKEN                End-of-document token (default: <|endoftext|>)
+  WORKERS                  Concurrent DataTrove workers (default: min(96, available CPUs))
+  FINEPDFS_WORKERS         finepdfs-only workers (default: min(20, WORKERS))
   READER_BATCH_SIZE        Parquet reader batch size (default: 1000)
   TOKENIZER_BATCH_SIZE     Tokenizer batch size (default: 1000)
   STACK_V3_SEED            Stable Stack v3 augmentation seed (default: 1234)
   STACK_V3_MAX_CHARS       Maximum rendered characters per Stack document (default: 1048576)
-  STACK_V3_WORKERS         Stack-only workers (default: 96)
+  STACK_V3_WORKERS         Stack-only workers (default: min(16, WORKERS))
   STACK_V3_TASKS           Stable Stack output shard count (default: 192)
   STACK_V3_READER_BATCH_SIZE     Stack-only Parquet batch size (default: 1)
   STACK_V3_TOKENIZER_BATCH_SIZE  Stack-only tokenizer batch size (default: 1)
   ALLOW_INCOMPLETE_INPUT   Set to 1 to ignore source .tmp files (default: 0)
   RUN_LOG                  Background log path
   PID_FILE                 Background PID path
+  CODESIGN_START_INDEX     First dataset index to process (default: 0)
+  CODESIGN_END_INDEX       Last dataset index to process (default: last)
+  CODESIGN_REVERSE         Process selected datasets in reverse order (default: 0)
 EOF
 }
 
@@ -75,29 +80,42 @@ if (( $# > 1 )); then
   exit 2
 fi
 
-INPUT_ROOT="${INPUT_ROOT:-/cb/ml-cold/michaelw/codesign_pretrain/processed_hf}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/cb/ml-cold/michaelw/codesign_pretrain/tokenized}"
-TOKENIZER="${TOKENIZER:-openai/gpt-oss-20b}"
+HEURISTICS_ROOT="${HEURISTICS_ROOT:-/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets}"
+DEDUPED_ROOT="${DEDUPED_ROOT:-/cb/ml-olympus/codesign_pretrain/deduped_datasets}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/cb/ml-olympus/codesign_pretrain/tokenized/mellum2}"
+TOKENIZER="${TOKENIZER:-JetBrains/Mellum2-12B-A2.5B-Base}"
 TOKENIZER_REVISION="${TOKENIZER_REVISION:-main}"
-EOS_TOKEN="${EOS_TOKEN:-<|return|>}"
-WORKERS="${WORKERS:-$(nproc)}"
+EOS_TOKEN="${EOS_TOKEN:-<|endoftext|>}"
+available_cpus="$(nproc)"
+default_workers=$(( available_cpus < 96 ? available_cpus : 96 ))
+WORKERS="${WORKERS:-$default_workers}"
+default_finepdfs_workers=$(( WORKERS < 20 ? WORKERS : 20 ))
+FINEPDFS_WORKERS="${FINEPDFS_WORKERS:-$default_finepdfs_workers}"
 READER_BATCH_SIZE="${READER_BATCH_SIZE:-1000}"
 TOKENIZER_BATCH_SIZE="${TOKENIZER_BATCH_SIZE:-1000}"
 STACK_V3_SEED="${STACK_V3_SEED:-1234}"
 STACK_V3_MAX_CHARS="${STACK_V3_MAX_CHARS:-1048576}"
-STACK_V3_WORKERS="${STACK_V3_WORKERS:-96}"
+default_stack_workers=$(( WORKERS < 16 ? WORKERS : 16 ))
+STACK_V3_WORKERS="${STACK_V3_WORKERS:-$default_stack_workers}"
 STACK_V3_TASKS="${STACK_V3_TASKS:-192}"
 STACK_V3_READER_BATCH_SIZE="${STACK_V3_READER_BATCH_SIZE:-1}"
 STACK_V3_TOKENIZER_BATCH_SIZE="${STACK_V3_TOKENIZER_BATCH_SIZE:-1}"
 ALLOW_INCOMPLETE_INPUT="${ALLOW_INCOMPLETE_INPUT:-0}"
 TOKENIZATION_PYTHON="${TOKENIZATION_PYTHON:-}"
+if [[ -z "$TOKENIZATION_PYTHON" && -x "$REPO_ROOT/../envs/datatrove/bin/python" ]]; then
+  TOKENIZATION_PYTHON="$REPO_ROOT/../envs/datatrove/bin/python"
+fi
 DATATROVE_ROOT="${DATATROVE_ROOT:-}"
 RUN_LOG="${RUN_LOG:-$SCRIPT_DIR/tokenization.log}"
 PID_FILE="${PID_FILE:-$OUTPUT_ROOT/tokenization.pid}"
+CODESIGN_START_INDEX="${CODESIGN_START_INDEX:-0}"
+CODESIGN_END_INDEX="${CODESIGN_END_INDEX:-}"
+CODESIGN_REVERSE="${CODESIGN_REVERSE:-0}"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 for numeric_value in \
   "$WORKERS" \
+  "$FINEPDFS_WORKERS" \
   "$READER_BATCH_SIZE" \
   "$TOKENIZER_BATCH_SIZE" \
   "$STACK_V3_MAX_CHARS" \
@@ -114,10 +132,12 @@ if [[ ! "$STACK_V3_SEED" =~ ^-?[0-9]+$ ]]; then
   echo "STOP: STACK_V3_SEED must be an integer, got: $STACK_V3_SEED" >&2
   exit 2
 fi
-if [[ ! -d "$INPUT_ROOT" ]]; then
-  echo "STOP: input root does not exist: $INPUT_ROOT" >&2
-  exit 1
-fi
+for input_root in "$HEURISTICS_ROOT" "$DEDUPED_ROOT"; do
+  if [[ ! -d "$input_root" ]]; then
+    echo "STOP: input root does not exist: $input_root" >&2
+    exit 1
+  fi
+done
 if [[ -n "$DATATROVE_ROOT" ]]; then
   datatrove_source="$DATATROVE_ROOT/src"
   if [[ ! -d "$datatrove_source/datatrove" ]]; then
@@ -143,7 +163,7 @@ if [[ "$ALLOW_INCOMPLETE_INPUT" != "0" && "$ALLOW_INCOMPLETE_INPUT" != "1" ]]; t
   exit 2
 fi
 
-temporary_file_count="$(find "$INPUT_ROOT" -type f -name '*.tmp' -print | wc -l)"
+temporary_file_count="$(find "$HEURISTICS_ROOT" "$DEDUPED_ROOT" -type f -name '*.tmp' -print | wc -l)"
 if (( temporary_file_count > 0 )); then
   if [[ "$action" == "dry-run" ]]; then
     echo "WARNING: found $temporary_file_count source .tmp files; a real run will stop by default." >&2
@@ -155,71 +175,109 @@ if (( temporary_file_count > 0 )); then
     echo "WARNING: ignoring $temporary_file_count source .tmp files by explicit request." >&2
   fi
 fi
+if [[ "$action" != "dry-run" ]] \
+  && ! "${python_command[@]}" -c 'import datatrove, huggingface_hub, humanize, orjson, pyarrow, tokenizers' >/dev/null 2>&1; then
+  echo "STOP: tokenization Python is missing a DataTrove dependency." >&2
+  echo "Use a prepared container/environment and set TOKENIZATION_PYTHON if needed." >&2
+  exit 1
+fi
 
+# One entry per reviewed source-to-target tokenization unit.
+# Fields: source root | source-relative folder | output-relative folder | text column | file glob | renderer.
 dataset_specs=(
-  "Nemotron-CC-Code-v1|text|*.parquet|identity"
-  "Nemotron-CC-Math-v1|text|*.parquet|identity"
-  "Nemotron-CC-v2|text|*.parquet|identity"
-  "Nemotron-CC-v2.1|text|*.parquet|identity"
-  "Nemotron-Pretraining-Legal-v1|text|*.parquet|identity"
-  "Nemotron-Pretraining-Specialized-v1|text|*.parquet|identity"
-  "Nemotron-Pretraining-Specialized-v1.1|text|*.parquet|identity"
-  "Nemotron-Pretraining-Specialized-v1.2|text|*.parquet|identity"
-  "Ultra-FineWeb|content|*.parquet|identity"
-  "Ultra-FineWeb-L3|content|*.parquet|identity"
-  "finepdfs|text|*.parquet|identity"
-  "peS2o|text|*.json.gz|identity"
-  "pubmed|text|*.jsonl.gz|identity"
-  "uspto|text|*.parquet|identity"
-  "stack-v3-train|text|*.parquet|stack-v3"
+  # "heuristics|Nemotron-CC-v2/Diverse-QA|Nemotron-CC-v2/Diverse-QA|text|*.parquet|identity"
+  # "heuristics|Nemotron-CC-v2/High-Quality|Nemotron-CC-v2/High-Quality|text|*.parquet|identity"
+  # "heuristics|Nemotron-CC-v2/High-Quality-Synthetic|Nemotron-CC-v2/High-Quality-Synthetic|text|*.parquet|identity"
+  # "heuristics|Nemotron-CC-v2/Medium-High-Quality|Nemotron-CC-v2/Medium-High-Quality|text|*.parquet|identity"
+  # "heuristics|Nemotron-CC-v2/Translated-Diverse-QA|Nemotron-CC-v2/Translated-Diverse-QA|text|*.parquet|identity"
+  # "heuristics|Nemotron-CC-v2.1/High-Quality|Nemotron-CC-v2.1/High-Quality|text|*.parquet|identity"
+  # "heuristics|Nemotron-CC-v2.1/High-Quality-Synthetic|Nemotron-CC-v2.1/High-Quality-Synthetic|text|*.parquet|identity"
+  # "heuristics|Nemotron-CC-v2.1/High-Quality-Translated-To-English|Nemotron-CC-v2.1/High-Quality-Translated-To-English|text|*.parquet|identity"
+  # "heuristics|Nemotron-CC-v2.1/High-Quality-Translated-To-English-Synthetic|Nemotron-CC-v2.1/High-Quality-Translated-To-English-Synthetic|text|*.parquet|identity"
+  # "heuristics|Nemotron-CC-v2.1/Medium-High-Quality|Nemotron-CC-v2.1/Medium-High-Quality|text|*.parquet|identity"
+  "heuristics|Nemotron-CC-v2.1/Medium-High-Quality-Synthetic|Nemotron-CC-v2.1/Medium-High-Quality-Synthetic|text|*.parquet|identity"
+  "heuristics|Nemotron-CC-v2.1/Medium-High-Quality-Translated-To-English|Nemotron-CC-v2.1/Medium-High-Quality-Translated-To-English|text|*.parquet|identity"
+  "heuristics|Nemotron-CC-Code-v1/data|Nemotron-CC-Code-v1|text|*.parquet|identity"
+  "heuristics|Nemotron-CC-Math-v1/3|Nemotron-CC-Math-v1/3|text|*.parquet|identity"
+  "heuristics|Nemotron-CC-Math-v1/4plus|Nemotron-CC-Math-v1/4plus|text|*.parquet|identity"
+  "heuristics|Nemotron-CC-Math-v1/4plus_MIND|Nemotron-CC-Math-v1/4plus_MIND|text|*.parquet|identity"
+  "heuristics|Ultra-FineWeb-L3/data/ultrafineweb_en_l3|Ultra-FineWeb-L3/ultrafineweb_en_l3|content|*.parquet|identity"
+  "heuristics|Ultra-FineWeb-L3/data/ultrafineweb_zh_l3|Ultra-FineWeb-L3/ultrafineweb_zh_l3|content|*.parquet|identity"
+  "heuristics|finepdfs|finepdfs|text|*.parquet|identity"
+  "heuristics|stack-v3-train/data|stack-v3-train|text|*.parquet|stack-v3"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Legal-v1|Nemotron-Pretraining-Legal-v1|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Math-Textbooks|Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Math-Textbooks|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-STEM-SFT|Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-STEM-SFT|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Scientific-Coding|Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Scientific-Coding|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Wiki-Rewrite|Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Wiki-Rewrite|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Code-Concepts|Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Code-Concepts|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Economics|Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Economics|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Formal-Logic|Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Formal-Logic|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Multiple-Choice|Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Multiple-Choice|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Fact-Seeking|Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Fact-Seeking|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Generative|Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Generative|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Moral-Scenarios|Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Moral-Scenarios|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Multiple-Choice|Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Multiple-Choice|text|*.parquet|identity"
+  # "deduped|puffer_exact_specialized_v1/peS2o|peS2o|text|*.json.gz|identity"
+  # "deduped|puffer_exact_specialized_v1/pubmed/data|pubmed|text|*.jsonl.gz|identity"
+  # "deduped|puffer_exact_specialized_v1/uspto|uspto|text|*.parquet|identity"
+  # "deduped|puffer_minhash_ufw_en_v1_4_p128_b8_lsh_only_v1/Ultra-FineWeb/data/ultrafineweb_en_v1_4|Ultra-FineWeb/ultrafineweb_en_v1_4|content|*.parquet|identity"
+  # "deduped|puffer_minhash_ufw_en_v1_4_p128_b8_lsh_only_v1/Ultra-FineWeb/data/ultrafineweb_l1_en_hq|Ultra-FineWeb/ultrafineweb_l1_en_hq|content|*.parquet|identity"
+  # "deduped|puffer_minhash_ufw_en_v1_4_p128_b8_lsh_only_v1/Ultra-FineWeb/data/ultrafineweb_zh|Ultra-FineWeb/ultrafineweb_zh|content|*.parquet|identity"
 )
-
-discover_dataset_units() {
-  local input_folder="$1"
-  local path_glob="$2"
-  "${python_command[@]}" - "$input_folder" "$path_glob" <<'PY'
-import fnmatch
-from pathlib import Path
-import sys
-
-input_folder = Path(sys.argv[1])
-path_glob = sys.argv[2]
-paths = sorted(
-    path.relative_to(input_folder).as_posix()
-    for path in input_folder.rglob("*")
-    if path.is_file() and fnmatch.fnmatch(path.relative_to(input_folder).as_posix(), path_glob)
-)
-if not paths:
-    raise SystemExit(1)
-
-directories = [Path(path).parts[:-1] for path in paths]
-common_prefix = []
-for components in zip(*directories):
-    if len(set(components)) != 1:
-        break
-    common_prefix.append(components[0])
-
-branch_by_path = {}
-for path, directory in zip(paths, directories):
-    branch_by_path[path] = directory[len(common_prefix)] if len(directory) > len(common_prefix) else ""
-branches = sorted(set(branch_by_path.values()))
-if "" in branches or len(branches) <= 1:
-    sys.stdout.write(".\t\n")
-else:
-    for branch in branches:
-        source_prefix = "/".join((*common_prefix, branch))
-        sys.stdout.write(f"{branch}\t{source_prefix}\n")
-PY
-}
+if [[ -z "$CODESIGN_END_INDEX" ]]; then
+  CODESIGN_END_INDEX=$((${#dataset_specs[@]} - 1))
+fi
+if [[ ! "$CODESIGN_START_INDEX" =~ ^[0-9]+$ || ! "$CODESIGN_END_INDEX" =~ ^[0-9]+$ ]]; then
+  echo "STOP: CODESIGN_START_INDEX and CODESIGN_END_INDEX must be nonnegative integers." >&2
+  exit 2
+fi
+CODESIGN_START_INDEX=$((10#$CODESIGN_START_INDEX))
+CODESIGN_END_INDEX=$((10#$CODESIGN_END_INDEX))
+if (( CODESIGN_START_INDEX > CODESIGN_END_INDEX || CODESIGN_END_INDEX >= ${#dataset_specs[@]} )); then
+  echo "STOP: dataset indexes must satisfy 0 <= start <= end < ${#dataset_specs[@]}." >&2
+  exit 2
+fi
+if [[ "$CODESIGN_REVERSE" != "0" && "$CODESIGN_REVERSE" != "1" ]]; then
+  echo "STOP: CODESIGN_REVERSE must be 0 or 1." >&2
+  exit 2
+fi
+if [[ "$action" != "dry-run" ]] && \
+  (( CODESIGN_START_INDEX != 0 || CODESIGN_END_INDEX != ${#dataset_specs[@]}-1 || CODESIGN_REVERSE == 1 )); then
+  if ! command -v findmnt >/dev/null 2>&1; then
+    echo "STOP: findmnt is needed to verify cross-machine output locking." >&2
+    exit 1
+  fi
+  output_mount_options="$(findmnt -T "$OUTPUT_ROOT" -no OPTIONS)"
+  if [[ ",$output_mount_options," != *",flock,"* ]]; then
+    echo "STOP: output filesystem must be mounted with cluster-wide flock: $OUTPUT_ROOT" >&2
+    exit 1
+  fi
+fi
+selected_count=$((CODESIGN_END_INDEX - CODESIGN_START_INDEX + 1))
+dataset_specs=("${dataset_specs[@]:CODESIGN_START_INDEX:selected_count}")
+if [[ "$CODESIGN_REVERSE" == "1" ]]; then
+  reversed_specs=()
+  for ((spec_index=${#dataset_specs[@]}-1; spec_index>=0; spec_index--)); do
+    reversed_specs+=("${dataset_specs[spec_index]}")
+  done
+  dataset_specs=("${reversed_specs[@]}")
+fi
 
 dataset_output_is_complete() {
   local output_folder="$1"
-  "${python_command[@]}" - "$output_folder" <<'PY'
+  local input_folder="$2"
+  local path_glob="$3"
+  local text_column="$4"
+  local text_renderer="$5"
+  "${python_command[@]}" - "$output_folder" "$input_folder" "$path_glob" "$text_column" "$text_renderer" "$TOKENIZER" "$EOS_TOKEN" <<'PY'
 import json
 from pathlib import Path
 import sys
 
 output_folder = Path(sys.argv[1])
+input_folder = Path(sys.argv[2]).resolve()
+path_glob, text_column, text_renderer, tokenizer_id, eos_token = sys.argv[3:]
 manifest_path = output_folder / "manifest.json"
 result_path = output_folder / "result.json"
 prefixes_path = output_folder / "data_prefixes.txt"
@@ -227,6 +285,19 @@ if not (manifest_path.is_file() and prefixes_path.is_file()):
     raise SystemExit(1)
 
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+dataset = manifest.get("dataset", {})
+pipeline = manifest.get("pipeline", {})
+tokenizer = manifest.get("tokenizer", {})
+renderer = manifest.get("renderer", {})
+if (
+    dataset.get("root") != str(input_folder)
+    or dataset.get("path_glob") != path_glob
+    or pipeline.get("text_column") != text_column
+    or tokenizer.get("id") != tokenizer_id
+    or tokenizer.get("eos_token") != eos_token
+    or renderer.get("name") != text_renderer
+):
+    raise SystemExit(2)
 if manifest.get("storage") == "filtered-index-with-shared-bin-symlink":
     shards = manifest.get("shards")
     if not isinstance(shards, list) or not shards:
@@ -291,29 +362,39 @@ if [[ "$action" == "background" ]]; then
       exit 1
     fi
   fi
-  nohup "$SCRIPT_DIR/tokenize_codesign_pretrain.sh" >"$RUN_LOG" 2>&1 </dev/null &
+  nohup bash "$SCRIPT_DIR/tokenize_codesign_pretrain.sh" >"$RUN_LOG" 2>&1 </dev/null &
   background_pid=$!
   printf '%s\n' "$background_pid" >"$PID_FILE"
   echo "Tokenization started: PID=$background_pid log=$RUN_LOG"
   exit 0
 fi
 
-echo "INPUT_ROOT: $INPUT_ROOT"
+echo "HEURISTICS_ROOT: $HEURISTICS_ROOT"
+echo "DEDUPED_ROOT: $DEDUPED_ROOT"
 echo "OUTPUT_ROOT: $OUTPUT_ROOT"
 echo "TOKENIZER: $TOKENIZER@$TOKENIZER_REVISION"
+echo "EOS_TOKEN: $EOS_TOKEN"
 echo "TOKENIZATION_PYTHON: ${TOKENIZATION_PYTHON:-uv run --no-sync python}"
 if [[ -n "$DATATROVE_ROOT" ]]; then
   echo "DATATROVE_ROOT: $DATATROVE_ROOT"
 fi
 echo "WORKERS: $WORKERS"
+echo "FINEPDFS_WORKERS: $FINEPDFS_WORKERS"
 echo "STACK_V3_SEED: $STACK_V3_SEED"
 echo "STACK_V3: workers=$STACK_V3_WORKERS tasks=$STACK_V3_TASKS max_chars=$STACK_V3_MAX_CHARS batches=$STACK_V3_READER_BATCH_SIZE/$STACK_V3_TOKENIZER_BATCH_SIZE"
 
 for spec in "${dataset_specs[@]}"; do
-  IFS='|' read -r dataset_name text_column path_glob text_renderer <<<"$spec"
-  input_folder="$INPUT_ROOT/$dataset_name"
+  IFS='|' read -r source_root_name source_relative output_relative text_column path_glob text_renderer <<<"$spec"
+  case "$source_root_name" in
+    heuristics) source_root="$HEURISTICS_ROOT" ;;
+    deduped) source_root="$DEDUPED_ROOT" ;;
+    *) echo "STOP: unknown source root: $source_root_name" >&2; exit 2 ;;
+  esac
+  input_folder="$source_root/$source_relative"
+  output_folder="$OUTPUT_ROOT/$output_relative"
+  display_name="$output_relative"
   if [[ ! -d "$input_folder" ]]; then
-    echo "STOP: expected dataset directory does not exist: $input_folder" >&2
+    echo "STOP: expected source directory does not exist: $input_folder" >&2
     exit 1
   fi
   first_input="$(find "$input_folder" -type f -name "$path_glob" -print -quit)"
@@ -322,88 +403,73 @@ for spec in "${dataset_specs[@]}"; do
     exit 1
   fi
 
-  mapfile -t dataset_units < <(discover_dataset_units "$input_folder" "$path_glob")
-  if (( ${#dataset_units[@]} == 0 )); then
-    echo "STOP: failed to discover tokenization units under $input_folder" >&2
+  dataset_workers="$WORKERS"
+  dataset_reader_batch_size="$READER_BATCH_SIZE"
+  dataset_tokenizer_batch_size="$TOKENIZER_BATCH_SIZE"
+  extra_arguments=()
+  if [[ "$output_relative" == "finepdfs" ]]; then
+    dataset_workers="$FINEPDFS_WORKERS"
+  elif [[ "$text_renderer" == "stack-v3" ]]; then
+    dataset_workers="$STACK_V3_WORKERS"
+    dataset_reader_batch_size="$STACK_V3_READER_BATCH_SIZE"
+    dataset_tokenizer_batch_size="$STACK_V3_TOKENIZER_BATCH_SIZE"
+    extra_arguments=(
+      --tasks "$STACK_V3_TASKS"
+      --renderer-seed "$STACK_V3_SEED"
+      --renderer-max-chars "$STACK_V3_MAX_CHARS"
+    )
+  fi
+
+  if [[ -f "$output_folder/manifest.json" ]] \
+    && dataset_output_is_complete "$output_folder" "$input_folder" "$path_glob" "$text_column" "$text_renderer"; then
+    echo "SKIP: $display_name (complete; hierarchy and output files validated)"
+    continue
+  fi
+  if [[ -f "$output_folder/result.json" ]]; then
+    echo "STOP: completion marker exists but output validation failed: $output_folder" >&2
     exit 1
   fi
-  for unit in "${dataset_units[@]}"; do
-    IFS=$'\t' read -r output_name source_config <<<"$unit"
-    output_folder="$OUTPUT_ROOT/$dataset_name"
-    display_name="$dataset_name"
-    config_arguments=()
-    if [[ "$output_name" != "." ]]; then
-      output_folder="$output_folder/$output_name"
-      display_name="$display_name/$output_name"
-      config_arguments=(--config "$source_config")
-    fi
 
-    dataset_workers="$WORKERS"
-    dataset_reader_batch_size="$READER_BATCH_SIZE"
-    dataset_tokenizer_batch_size="$TOKENIZER_BATCH_SIZE"
-    extra_arguments=()
-    if [[ "$text_renderer" == "stack-v3" ]]; then
-      dataset_workers="$STACK_V3_WORKERS"
-      dataset_reader_batch_size="$STACK_V3_READER_BATCH_SIZE"
-      dataset_tokenizer_batch_size="$STACK_V3_TOKENIZER_BATCH_SIZE"
-      extra_arguments=(
-        --tasks "$STACK_V3_TASKS"
-        --renderer-seed "$STACK_V3_SEED"
-        --renderer-max-chars "$STACK_V3_MAX_CHARS"
-      )
-    fi
-
-    if dataset_output_is_complete "$output_folder"; then
-      echo "SKIP: $display_name (complete; hierarchy and output files validated)"
-      continue
-    fi
-    if [[ -f "$output_folder/result.json" ]]; then
-      echo "STOP: completion marker exists but output validation failed: $output_folder" >&2
+  command=(
+    "${python_command[@]}" "$REPO_ROOT/mw_scripts/process_datatrove.py"
+    --input-folder "$input_folder"
+    --path-glob "$path_glob"
+    --text-column "$text_column"
+    --text-renderer "$text_renderer"
+    --output-folder "$output_folder"
+    --tokenizer "$TOKENIZER"
+    --tokenizer-revision "$TOKENIZER_REVISION"
+    --eos-token "$EOS_TOKEN"
+    --workers "$dataset_workers"
+    --reader-batch-size "$dataset_reader_batch_size"
+    --tokenizer-batch-size "$dataset_tokenizer_batch_size"
+    "${extra_arguments[@]}"
+  )
+  if [[ -f "$output_folder/manifest.json" ]]; then
+    if [[ ! -f "$output_folder/result.json" ]] \
+      && grep -q 'filtered-index-with-shared-bin-symlink' "$output_folder/manifest.json"; then
+      echo "STOP: zero-copy subset output failed validation and cannot be resumed: $output_folder" >&2
       exit 1
     fi
-
-    command=(
-      "${python_command[@]}" "$REPO_ROOT/mw_scripts/process_datatrove.py"
-      --input-folder "$input_folder"
-      --path-glob "$path_glob"
-      --text-column "$text_column"
-      --text-renderer "$text_renderer"
-      --output-folder "$output_folder"
-      --tokenizer "$TOKENIZER"
-      --tokenizer-revision "$TOKENIZER_REVISION"
-      --eos-token "$EOS_TOKEN"
-      --workers "$dataset_workers"
-      --reader-batch-size "$dataset_reader_batch_size"
-      --tokenizer-batch-size "$dataset_tokenizer_batch_size"
-      "${config_arguments[@]}"
-      "${extra_arguments[@]}"
-    )
-    if [[ -f "$output_folder/manifest.json" ]]; then
-      if [[ ! -f "$output_folder/result.json" ]] \
-        && grep -q 'filtered-index-with-shared-bin-symlink' "$output_folder/manifest.json"; then
-        echo "STOP: zero-copy subset output failed validation and cannot be resumed: $output_folder" >&2
-        exit 1
-      fi
-      command+=(--resume)
-    elif [[ -d "$output_folder" ]]; then
-      first_output="$(find "$output_folder" -mindepth 1 -print -quit)"
-      if [[ -n "$first_output" ]]; then
-        echo "STOP: non-empty output has no resumable manifest: $output_folder" >&2
-        exit 1
-      fi
+    command+=(--resume)
+  elif [[ -d "$output_folder" ]]; then
+    first_output="$(find "$output_folder" -mindepth 1 -print -quit)"
+    if [[ -n "$first_output" ]]; then
+      echo "STOP: non-empty output has no resumable manifest: $output_folder" >&2
+      exit 1
     fi
+  fi
 
-    if [[ "$action" == "dry-run" ]]; then
-      printf 'DRY RUN:'
-      printf ' %q' "${command[@]}"
-      printf '\n'
-      continue
-    fi
+  if [[ "$action" == "dry-run" ]]; then
+    printf 'DRY RUN:'
+    printf ' %q' "${command[@]}"
+    printf '\n'
+    continue
+  fi
 
-    echo "START: $display_name ($path_glob, text_column=$text_column, text_renderer=$text_renderer)"
-    "${command[@]}"
-    echo "DONE: $display_name"
-  done
+  echo "START: $display_name ($path_glob, text_column=$text_column, text_renderer=$text_renderer)"
+  "${command[@]}"
+  echo "DONE: $display_name"
 done
 
 if [[ "$action" == "dry-run" ]]; then
