@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import importlib.util
 import json
@@ -34,9 +35,16 @@ def test_batch_128_requires_16_gpu_mesh() -> None:
         configuration.validate_parallelism(config, world_size=24, experts=64)
 
 
+def test_parallel_architecture_name_is_accepted(tmp_path: Path) -> None:
+    source = (REPO / "mw_scripts/mellum2_3xh200/config.yaml").read_text()
+    target = tmp_path / "parallel.yaml"
+    target.write_text(source.replace("architecture: original", "architecture: parallel_attention_moe"))
+    assert configuration.read_config(target)["model"]["architecture"] == "parallel_attention_moe"
+
+
 @pytest.mark.parametrize(
     ("nodes_override", "expected_nodes"),
-    [(None, ["172.31.223.220", "172.31.210.225"]), ("node-a node-b node-c", ["node-a", "node-b", "node-c"])],
+    [(None, ["172.31.210.225"]), ("node-a node-b node-c", ["node-a", "node-b", "node-c"])],
 )
 def test_launcher_derives_topology_without_contacting_real_nodes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nodes_override: str | None, expected_nodes: list[str]
@@ -75,6 +83,67 @@ def test_launcher_derives_topology_without_contacting_real_nodes(
         assert command[-4:] == [str(rank), str(len(expected_nodes)), expected_nodes[0], "29541"]
 
 
+def test_all_variant_configs_are_complete_and_valid() -> None:
+    config_dir = REPO / "mw_scripts/mellum2_3xh200/config"
+    variants = ("v0", "v1", "v2", "v3", "v3_1", "v4")
+    expected = {f"{family}-{variant}.yaml" for family in ("base", "thinking") for variant in variants}
+    assert {path.name for path in config_dir.glob("*.yaml")} == expected
+    for path in config_dir.glob("*.yaml"):
+        config = configuration.read_config(path)
+        family, variant = path.stem.split("-")
+        assert config["model"]["architecture"] == variant
+        assert family in config["model"]["hf_path"].lower()
+        assert config["train"]["train_tokens"] == 10_000_000_000
+        assert config["run"]["save_interval"] == 100
+        assert config["run"]["keep_last_checkpoints"] == 3
+        assert config["wandb"]["run_name"].endswith("_10B")
+        assert config["run"]["directory"].endswith("_10B")
+        assert sum(config["dataset"]["subsets"].values()) == pytest.approx(100.0)
+        expected_micro_batch_size = 2 if variant == "v4" else 1
+        expected_accumulation = 12 if variant == "v4" else 24
+        assert config["train"]["micro_batch_size"] == expected_micro_batch_size
+        assert configuration.validate_parallelism(config, world_size=8, experts=64) == expected_accumulation
+        # v4's zero-initialized dense residual branch requires a much lower LR
+        # than the full-finetune arms; a long run at 3e-6 became non-finite.
+        expected_lr = 0.00000003 if variant == "v4" else 0.00003
+        assert config["optimizer"]["lr"] == expected_lr
+
+
+@pytest.mark.parametrize("variant", ["base-v2", "base-v3_1", "thinking-v3_1", "base-v4", "thinking-v4"])
+def test_launcher_selects_variant_config_without_contacting_nodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
+) -> None:
+    ssh_log = tmp_path / "ssh.jsonl"
+    ssh_stub = tmp_path / "ssh"
+    ssh_stub.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, shlex, sys\n"
+        "with open(os.environ['MELLUM_SSH_TEST_LOG'], 'a') as handle:\n"
+        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "command = shlex.split(sys.argv[-1])\n"
+        "if command == ['id', '-u']: sys.stdout.write('2087\\n')\n"
+        "if command == ['id', '-g']: sys.stdout.write('9004\\n')\n"
+    )
+    ssh_stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("MELLUM_SSH_TEST_LOG", str(ssh_log))
+    monkeypatch.setenv("MELLUM_ENV_FILE", "")
+    monkeypatch.delenv("MELLUM_CONFIG", raising=False)
+    subprocess.run(
+        [
+            "bash",
+            str(REPO / "mw_scripts/mellum2_3xh200/launch.sh"),
+            "--variant",
+            variant,
+            "--dry-run",
+        ],
+        check=True,
+    )
+    calls = [shlex.split(json.loads(line)[-1]) for line in ssh_log.read_text().splitlines()]
+    launch = next(call for call in calls if call[:2] == ["docker", "exec"])
+    assert launch[-5].endswith(f"/config/{variant}.yaml")
+
+
 def test_folded_mesh_tp2_ep8_is_valid():
     config = configuration.read_config(REPO / "mw_scripts/mellum2_3xh200/config.yaml")
     config["parallelism"]["tensor_model_parallel_size"] = 2
@@ -109,6 +178,7 @@ def container_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MELLUM_ENV_FILE", "")
     monkeypatch.setenv("MELLUM_NODES", "node-a node-b")
     monkeypatch.delenv("MELLUM_CONTAINER", raising=False)
+    monkeypatch.delenv("MELLUM_MEMORY_GIB", raising=False)
     monkeypatch.setenv("MELLUM_HOST_DATA", "/test/data")
     monkeypatch.setenv("MELLUM_HOST_RUNS", "/test/output")
     monkeypatch.setenv("MELLUM_REMOTE_RUNS", "/workspace/ml-olympus/codesign_pretrain/runs")
@@ -121,7 +191,11 @@ def container_launcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             text=True,
             check=False,
         )
-        calls = [shlex.split(json.loads(line)[-1]) for line in ssh_log.read_text().splitlines()]
+        calls = (
+            [shlex.split(json.loads(line)[-1]) for line in ssh_log.read_text().splitlines()]
+            if ssh_log.exists()
+            else []
+        )
         return result, calls
 
     return invoke
@@ -134,12 +208,35 @@ def test_new_container_mounts_output_writable_and_data_readonly(container_launch
     assert len(runs) == 2
     for command in runs:
         assert command[command.index("--name") + 1] == "mellum2_3xh200"
+        assert command[command.index("--memory") + 1] == "1024g"
+        assert command[command.index("--memory-swap") + 1] == "1024g"
+        assert "nofile=262144:262144" in command
         assert "/test/data:/workspace/ml-olympus:ro" in command
         assert command[command.index("--mount") + 1] == (
             "type=bind,src=/test/output,dst=/workspace/ml-olympus/codesign_pretrain/runs"
         )
         assert calls[calls.index(command) - 1] == ["mkdir", "-p", "--", "/test/output"]
     assert not any(call[:2] in (["docker", "rm"], ["docker", "stop"]) for call in calls)
+
+
+def test_container_memory_budget_override(container_launcher, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MELLUM_MEMORY_GIB", "768")
+    result, calls = container_launcher("absent")
+    assert result.returncode == 0, result.stderr
+    for command in (call for call in calls if call[:2] == ["docker", "run"]):
+        assert command[command.index("--memory") + 1] == "768g"
+        assert command[command.index("--memory-swap") + 1] == "768g"
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "max", "1.5", "1024g"])
+def test_invalid_memory_budget_rejected_before_ssh(
+    container_launcher, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("MELLUM_MEMORY_GIB", value)
+    result, calls = container_launcher("absent")
+    assert result.returncode == 2
+    assert "MELLUM_MEMORY_GIB" in result.stderr
+    assert not calls
 
 
 @pytest.mark.parametrize("state", ["running", "wrong-mounts", "stopped"])
@@ -259,10 +356,29 @@ def test_mixture_weights_and_frozen_shards(tmp_path, monkeypatch):
 def test_resume_and_exit_do_not_change_mixture_identity():
     config = configuration.read_config(REPO / "mw_scripts/mellum2_3xh200/config.yaml")
     digest = configuration.config_digest(config)
-    config["run"].update(resume_checkpoint="/tmp/checkpoints", exit_interval=3)
+    config["run"].update(
+        resume_checkpoint="/tmp/checkpoints",
+        override_checkpoint_scheduler=True,
+        reset_optimizer_on_resume=True,
+        exit_interval=3,
+    )
     assert configuration.config_digest(config) == digest
     config["optimizer"]["lr"] *= 2
     assert configuration.config_digest(config) != digest
+
+
+def test_scheduler_recovery_rejects_unrelated_config_changes():
+    old_config = configuration.read_config(REPO / "mw_scripts/mellum2_3xh200/config.yaml")
+    new_config = copy.deepcopy(old_config)
+    new_config["optimizer"]["lr"] /= 10
+    new_config["optimizer"]["min_lr"] /= 10
+    new_config["scheduler"]["lr_warmup_iters"] += 1
+    new_config["run"].update(
+        resume_checkpoint="/tmp/checkpoints", override_checkpoint_scheduler=True
+    )
+    assert configuration.is_scheduler_recovery(old_config, new_config)
+    new_config["train"]["seed"] += 1
+    assert not configuration.is_scheduler_recovery(old_config, new_config)
 
 
 @pytest.mark.parametrize("policy", ["strict", "skip", None])

@@ -1,15 +1,39 @@
-# Mellum2 Thinking: Multi-Node H200 Continued Pretraining
+# Mellum2 Architecture Variants: H200 Continued Pretraining
 
-This pipeline loads pretrained weights from `JetBrains/Mellum2-12B-A2.5B-Thinking`
-and runs full-parameter continued pretraining with Megatron Bridge. By default,
-it uses only GPU nodes 31 and 32: eight H200 GPUs per node, 16 GPUs in total.
-The node count is derived automatically from `MELLUM_NODES`.
-The initial implementation preserves the original sequential attention → MoE architecture;
-`architecture: original` is the only implemented architecture.
+This pipeline runs continued pretraining for the Base and Thinking Mellum2
+checkpoints and the five architecture-surgery variants of each. v0-v3_1 train
+all parameters; v4 freezes the source model and trains only its new correction
+branches. The default
+target is GPU node 32 (one 8xH200 node); `MELLUM_NODES` still controls topology.
+
+Select one of the twelve cases with `--variant`:
+
+| Case | Graph | Initial HF checkpoint |
+|---|---|---|
+| `base-v0` | original sequential baseline | JetBrains Base |
+| `base-v1` | parallel attention/MoE | local byte-identical v1 derivative |
+| `base-v2` | shifted adjacent-layer schedule | local byte-identical v2 derivative |
+| `base-v3` | adjacent decoders in parallel | local byte-identical v3 derivative |
+| `base-v3_1` | parallel decoders with a merged expert pool | local byte-identical v3_1 derivative |
+| `base-v4` | parallel attention/MoE plus trainable correction | local v4 derivative with zero-output correction metadata |
+| `thinking-v0` | original sequential baseline | JetBrains Thinking |
+| `thinking-v1` | parallel attention/MoE | local byte-identical v1 derivative |
+| `thinking-v2` | shifted adjacent-layer schedule | local byte-identical v2 derivative |
+| `thinking-v3` | adjacent decoders in parallel | local byte-identical v3 derivative |
+| `thinking-v3_1` | parallel decoders with a merged expert pool | local byte-identical v3_1 derivative |
+| `thinking-v4` | parallel attention/MoE plus trainable correction | local v4 derivative with zero-output correction metadata |
+
+The ten derived checkpoints live under
+`/cb/ml-olympus/codesign_pretrain/checkpoints`. Every inherited tensor remains
+byte-identical to its source; `architecture_surgery.json` selects the graph and,
+for v4, specifies the deterministic correction-branch initialization. See
+`mw_scripts/model_surgeon/README.md` for the exact equations and invariants.
 
 ## Files and Configuration Entry Points
 
-- `config.yaml`: HF checkpoint, training parameters, data mixture, parallelism, and output directory.
+- `config/*.yaml`: the twelve complete case configs. v3_1 inherits v3's measured
+  starting point until its own throughput sweep is complete.
+- `config.yaml`: retained as a legacy editable example; the launcher does not select it by default.
 - `configuration.py`: YAML validation, tokenizer ID checks, and shard weight resolution.
 - `train.py`: training configuration, HF weight loading, training, and checkpoint resume.
 - `launch.sh`: SSH coordinator running on the current host; no local PyTorch installation is required.
@@ -17,29 +41,46 @@ The initial implementation preserves the original sequential attention → MoE a
 - `network_test.py`: cross-node NCCL correctness and bandwidth smoke test.
 - `validate.py`: weight round trips, logits, and cross-entropy comparisons for a toy or real checkpoint.
 - `wandb_logging.py`: W&B destination, authentication check, and persistent run identity.
-- `validation-report.md`: measured bring-up results and validation gaps.
 
 Model code lives in `src/megatron/bridge/models/mellum/`, and the base recipe lives in
 `src/megatron/bridge/recipes/mellum/`. Model parameters are derived from the HF config;
 tensor shapes are not hardcoded to the 12B model.
-Currently, support is limited to the original all-MoE architecture with SiLU,
+Model support is limited to the all-MoE Mellum2 architecture with SiLU,
 normalized top-k routing, and identical local/global RoPE bases.
 Unsupported variants raise errors. Parallel attention/MoE cannot be enabled by changing YAML alone.
 
-`config.yaml` is an editable starting point. **The equal-weight mixture and 50B-token budget
-are examples and have not been tuned for training quality.**
-The peak LR of `3e-5` and minimum LR of `3e-6` are initial experimental settings for continued
-pretraining from existing weights, not the model's official training hyperparameters.
-The initial layout is BF16, TP=1, PP=1, CP=1, EP=8, and ETP=1.
+The ten case configs use the same 100%-normalized mixture and 10B-token budget so
+convergence comparisons differ only by source checkpoint and graph.
+They save every 100 optimizer steps and set `run.keep_last_checkpoints: 3`.
+Bridge deletes older
+`iter_*` directories only after a newer checkpoint saves successfully, and it
+also saves the final checkpoint after normal completion.
+The full-parameter cases use peak/min LR `3e-5`/`3e-6`. v4 uses
+`3e-6`/`3e-7`: higher values through `3e-4` produced non-finite loss in
+accelerated peak-LR smokes. These are experimental continued-pretraining
+settings, not the model's official training hyperparameters.
+All one-node cases use BF16, TP=1, PP=1, CP=1, and ETP=1. The measured baseline
+uses EP=8; surgery variants use EP=4 with all-to-all dispatch and permute fusion.
+v0-v3_1 use MBS1. v4 uses MBS2 (12 gradient-accumulation steps), enabled by
+freezing the source weights; it measured 140.8k tokens/s on one 8xH200 node.
+v2/v3/v3_1 require PP=1 and do not support expert-parallel overlap. Before a long
+v3_1 run, use a short real-EP smoke test and confirm both merged expert pools receive
+router gradients and `merged_pool_frac_0` is neither pinned nor collapsed.
 
 ## Docker and File Paths
 
 Run these commands on the host containing the current checkout:
 
 ```bash
-bash mw_scripts/mellum2_3xh200/launch.sh --prepare-containers
-bash mw_scripts/mellum2_3xh200/launch.sh --preflight
+bash mw_scripts/mellum2_3xh200/launch.sh --variant thinking-v2 --prepare-containers
+bash mw_scripts/mellum2_3xh200/launch.sh --variant thinking-v2 --preflight
+bash mw_scripts/mellum2_3xh200/launch.sh --variant thinking-v2 --prepare
+bash mw_scripts/mellum2_3xh200/launch.sh --variant thinking-v2 --dry-run
+bash mw_scripts/mellum2_3xh200/launch.sh --variant thinking-v2 --train
 ```
+
+Actions and `--variant` may appear in either order. `MELLUM_CONFIG` remains an
+escape hatch for custom experiments, but it cannot be combined with `--variant`.
 
 Container preparation creates a persistent `mellum2_3xh200` container on each selected node,
 using `nemo:26.06`. An existing container with the same name is never deleted or recreated.
@@ -88,10 +129,11 @@ The HF cache defaults to this directory's `.cache/huggingface`, shared by the se
 Environment overrides:
 
 ```bash
-export MELLUM_NODES="172.31.223.220 172.31.210.225"
+export MELLUM_NODES="172.31.210.225"
 export MELLUM_CONTAINER=mellum2_3xh200
-export MELLUM_CONFIG=/workspace/ws/Megatron-Bridge/mw_scripts/mellum2_3xh200/config.yaml
 export MELLUM_MASTER_PORT=29541
+# Match the memory budget granted for the allocation (new containers only):
+export MELLUM_MEMORY_GIB=1024
 # If needed, choose a socket bootstrap interface reachable from the other selected nodes:
 # export NCCL_SOCKET_IFNAME=eth0
 ```
@@ -107,16 +149,16 @@ shared mounts and RDMA device access.
 
 Change only one environment variable. All prepare, dry-run, network-test, train, status,
 and stop operations use the same node list.
-The current default does not connect to GPU node 33. Override any old three-node setting
-that remains in your shell:
+The current default connects only to GPU node 32. Override stale multi-node settings
+that remain in your shell:
 
 ```bash
-export MELLUM_NODES="172.31.223.220 172.31.210.225"
+export MELLUM_NODES="172.31.210.225"
 bash mw_scripts/mellum2_3xh200/launch.sh --help    # Show nodes and GPU count locally; no SSH connections
 # On first use, complete the container and data preparation described below before proceeding:
-bash mw_scripts/mellum2_3xh200/launch.sh --dry-run
-bash mw_scripts/mellum2_3xh200/launch.sh --network-test
-bash mw_scripts/mellum2_3xh200/launch.sh --train
+bash mw_scripts/mellum2_3xh200/launch.sh --variant thinking-v2 --dry-run
+bash mw_scripts/mellum2_3xh200/launch.sh --variant thinking-v2 --network-test
+bash mw_scripts/mellum2_3xh200/launch.sh --variant thinking-v2 --train
 ```
 
 If a third node is allocated later, append its IP to `MELLUM_NODES` and repeat the same checks
@@ -127,15 +169,16 @@ no Python, shell, or YAML edits are needed.
 The historical directory and container name `mellum2_3xh200` is retained for path compatibility
 and does not restrict the actual number of nodes.
 
-With the defaults TP=PP=CP=ETP=1, EP=8, MBS=1, and GBS=192:
+With TP=PP=CP=ETP=1, MBS=1, and GBS=192:
 
-| Nodes | GPUs / Dense DP | Expert DP | Gradient Accumulation Steps per Update |
+| Nodes | GPUs / Dense DP | Expert DP (EP8 / EP4) | Gradient Accumulation Steps per Update |
 |---|---|---|---|
-| 2 | 16 | 2 | 12 |
-| 3 | 24 | 3 | 8 |
+| 1 | 8 | 1 / 2 | 24 |
+| 2 | 16 | 2 / 4 | 12 |
+| 3 | 24 | 3 / 6 | 8 |
 
 Both layouts retain `192 × 8192 = 1,572,864` tokens per update, so the training iteration count,
-warmup, and LR schedule remain unchanged. No changes to the default YAML are required.
+warmup, and LR schedule remain unchanged. No changes to the selected case YAML are required.
 Reducing DP increases each GPU's share of optimizer state; memory usage and performance still
 need smoke testing. Dry-run checks batch divisibility and expert mesh compatibility for other
 node counts or parallelism settings; not every combination is valid.
@@ -161,7 +204,7 @@ dataset:
     /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/High-Quality-Synthetic/data: 2
 ```
 
-The supplied `config.yaml` lists each directory directly containing `.bin/.idx` files,
+Each supplied `config/*.yaml` lists every directory directly containing `.bin/.idx` files,
 including the final `/data` component. This lets you independently tune categories such as
 `Nemotron-CC-v2/High-Quality-Synthetic/data` and `Nemotron-CC-Math-v1/3/data`.
 Each listed directory initially has example weight `1`; equal leaf-directory weights do not
@@ -233,9 +276,9 @@ tokens per optimizer step = global_batch_size × sequence_length
 train_iters = ceil(train_tokens / tokens per optimizer step)
 ```
 
-The default two-node setup uses DP=16, MBS=1, and GBS=192, accumulating 12 micro batches per update.
-EP=8 shards the experts; it does not introduce another division of the DP used for the global batch.
-With 64 experts and EP=8, each rank holds eight experts.
+The default one-node setup uses DP=8, MBS=1, and GBS=192, accumulating 24 micro batches per update.
+EP shards the experts; it does not introduce another division of the dense DP used for the global batch.
+With 64 experts, EP=8 holds eight experts per rank while EP=4 holds sixteen.
 GBS=128 is valid on 16 GPUs (eight accumulation steps), but is not divisible by MBS×DP=24 on 24 GPUs.
 Keeping GBS=192 lets you switch between these two layouts without changing tokens per update.
 
@@ -258,7 +301,7 @@ bash mw_scripts/mellum2_3xh200/launch.sh --network-test
 `--prepare` downloads the full HF checkpoint on the first node, validates the data,
 and saves `metadata/resolved_mixture.json`.
 The network test does not load the model. It checks all-reduce using every GPU on the selected
-nodes (16 GPUs by default).
+nodes (8 GPUs by default).
 Inspect `logs/network-test_node_*.log` for `NET/OFI`, `efa`, `AWS Libfabric`, and `NCCL PASS`.
 Seeing only Socket does not establish that EFA is active.
 Use `REQUIRE_EFA=0` for a diagnostic comparison if needed, but retain the default of 1 for production runs.
@@ -295,6 +338,47 @@ indices are unchanged. Existing prepared mixtures and dataset caches can be reus
 this fix does not require another `--prepare`. After restarting, monitor host memory
 and verify that training progresses beyond the previous failure point.
 
+### CPU memory policy
+
+The Mellum pipeline uses `CompactGPTDatasetConfig`, a Bridge dataset provider.
+It still constructs ordinary MCore `GPTDataset` objects, so dataset identities,
+mixture weights, sample order, and sampling cache keys do not change.
+After each shard has been built or loaded from cache, the builder releases its
+build-only `indices` array before loading subsequent shards and before creating
+DataLoader workers. For the current 11.65 billion sequences, those arrays would
+otherwise retain about 43.38 GiB per rank, or 347 GiB across eight ranks on a node.
+One shard's temporary construction arrays can still be allocated; this is not a
+guarantee about total peak RAM. Deferred index loading is intentionally disabled
+because it needs these arrays for length/epoch calculations.
+
+Token `.bin` files use bounded file reads rather than long-lived mmap mappings.
+Sampling `.npy` indices still use read-only mmap. This may change storage I/O
+performance, but does not change token values or invalidate the prepared mixture
+or existing sampling cache. No new `--prepare` is needed.
+
+New containers have a **1024 GiB CPU memory limit**, with no additional swap allowance.
+This leaves substantial headroom on the current 2 TiB nodes. Set `MELLUM_MEMORY_GIB`
+to the budget approved for your allocation before `--prepare-containers`.
+Existing containers are not automatically resized or replaced. GPU launch refuses
+an unlimited-memory container; recreate it explicitly if necessary. A container
+limit is a safety boundary, not a resource reservation or authorization to use a node.
+Use the allocation/launch process required by IT before restarting training.
+
+During training, `logs/cpu_memory_node_<rank>.jsonl` records cgroup CPU usage,
+anonymous memory, file cache, shared memory, page tables, OOM counters, and host
+`MemAvailable` every 30 seconds, tagged by launch ID. Warnings above 85% of the
+container limit appear in `logs/memory_monitor_node_<rank>.log`.
+Counters such as `file`, `shmem`, and `file_mapped` overlap and must not be summed.
+Read the JSONL from the host using the `/cb/ml-olympus/...` path:
+
+```bash
+tail -n 1 /cb/ml-olympus/codesign_pretrain/runs/mellum2_thinking_first_run_50B_1007/logs/cpu_memory_node_1.jsonl | jq
+```
+
+After restarting, check that memory reaches a sustainable plateau through dataset
+initialization, DataLoader startup, several hundred steps, and a checkpoint save.
+Passing correctness tests is not a substitute for this runtime memory validation.
+
 ## Logs, Stop, and Resume
 
 Output follows YAML `run.directory`. The current configuration writes under shared large storage:
@@ -307,6 +391,8 @@ metadata/resolved_mixture.json   Frozen data, tokenizer checksums, and configura
 metadata/ConfigContainer.yaml   Complete Bridge configuration
 metadata/wandb_run.json         Non-secret W&B destination and persistent run ID
 logs/train_node_0.log           First node; node 1 is the second, node 2 exists for three-node runs
+logs/cpu_memory_node_0.jsonl    CPU memory categories and host headroom, every 30 seconds
+logs/memory_monitor_node_0.log CPU memory warnings or monitoring failures
 logs/network-test_node_0.log    Network diagnostic log
 checkpoints/                   torch_dist weights, optimizer, RNG, and training state
 dataset_cache/                 Data index cache shared by selected nodes
@@ -332,15 +418,28 @@ If the smoke test exits at step 3, change `exit_interval` to 6 and run again to 
 ```yaml
 run:
   directory: /workspace/ml-olympus/codesign_pretrain/runs/mellum2_thinking_first_run_50B_1007
-  save_interval: 1000
+  save_interval: 100
+  keep_last_checkpoints: 3
   log_interval: 10
   resume_checkpoint: /workspace/ml-olympus/codesign_pretrain/runs/mellum2_thinking_first_run_50B_1007/checkpoints
+  # Leave omitted/false for a normal resume.
+  override_checkpoint_scheduler: false
+  # Numerical recovery only: retain weights/RNG/data position but reset optimizer moments.
+  reset_optimizer_on_resume: false
   exit_interval: null
 ```
 
 The initial run loads HF weights and creates a new optimizer.
 A resumed run loads optimizer/RNG state, data position, and the scheduler;
 it does not overwrite trained weights with the HF checkpoint again.
+For numerical recovery only, set `override_checkpoint_scheduler: true` to keep the
+checkpoint's optimizer state and completed-step count while applying the optimizer and
+scheduler values from YAML. This must be paired with `resume_checkpoint` and requires
+rerunning `--prepare` after changing an optimizer or scheduler value.
+If the optimizer moments may also be contaminated by an unstable trajectory, additionally set
+`reset_optimizer_on_resume: true`. The scheduler is advanced to the checkpoint's consumed-sample
+position, but Adam moments are freshly initialized. This option requires
+`override_checkpoint_scheduler: true`.
 An output directory containing existing checkpoints raises an error unless resume is explicitly requested.
 Changing the mixture or hyperparameters within the same run is not allowed;
 use a new directory for a new experiment.
@@ -362,7 +461,7 @@ The project is created by the first successful online run if it does not already
 provided your account has permission to create projects in this team.
 Project URL: [draft_pretrain](https://cerebras.wandb.io/team-inferenceml/draft_pretrain).
 The launcher does not create a project merely by reading YAML or running dry-run.
-Megatron Bridge initializes W&B only on the last global rank (rank 15 with the default 16 GPUs).
+Megatron Bridge initializes W&B only on the last global rank (rank 7 with the default 8 GPUs).
 It uploads the training scalar metrics and complete Bridge configuration, not 16 separate runs.
 The YAML `base_url` is authoritative. If `WANDB_BASE_URL` or `WANDB_HOST` is provided,
 it must match the YAML destination (a trailing slash is allowed), or authentication/training fails.
@@ -563,5 +662,4 @@ Parallel attention/MoE requires explicit definitions of the inputs read by both 
 normalization and residual rules, and initialization from the original weights.
 After architecture changes, validate against an HF/reference implementation of the new architecture,
 not against the original Thinking model's logits.
-Checkpoints must carry the new architecture's configuration;
-the current implementation rejects unimplemented architecture names.
+Parallel HF model directories must carry `architecture_surgery.json`; unknown architecture names are rejected.

@@ -19,6 +19,38 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention, Qwen3MoeRMSNorm
 
 
+# Graphs this reference can reproduce. Cross-layer variants (v2, v3, v3_1)
+# rearrange across layer boundaries and are NOT expressible in this per-layer
+# class; loading one must fail rather than quietly run the sequential graph and
+# report wrong evaluation numbers.
+SUPPORTED_SURGERY_VARIANTS = frozenset({"v0", "v1", "v4"})
+_LEGACY_ARCHITECTURE_TO_VARIANT = {"original": "v0", "parallel_attention_moe": "v1"}
+
+
+def resolve_surgery_variant(config: "PretrainedConfig") -> str:
+    """Return the surgery variant a checkpoint's config asks for.
+
+    Args:
+        config: A loaded Mellum configuration.
+
+    Returns:
+        The variant id; ``"v0"`` when the config carries no surgery marker.
+
+    Raises:
+        ValueError: If the config names a variant this reference cannot run.
+    """
+    variant = getattr(config, "megatron_bridge_surgery_variant", None)
+    if variant is None:
+        legacy = getattr(config, "megatron_bridge_architecture", None)
+        variant = _LEGACY_ARCHITECTURE_TO_VARIANT.get(str(legacy), "v0") if legacy else "v0"
+    if variant not in SUPPORTED_SURGERY_VARIANTS:
+        raise ValueError(
+            f"This Mellum reference implements {sorted(SUPPORTED_SURGERY_VARIANTS)} but the checkpoint "
+            f"requests {variant!r}. Running it here would silently evaluate a different computation graph."
+        )
+    return variant
+
+
 class MellumConfig(PretrainedConfig):
     """Compatibility configuration retaining the published Mellum fields."""
 
@@ -28,8 +60,13 @@ class MellumConfig(PretrainedConfig):
         # Base PretrainedConfig validates a single RoPE dictionary before it has
         # retained custom layer_types. Preserve Mellum's nested dictionaries.
         rope_parameters = kwargs.pop("rope_parameters", None)
+        # Default explicitly rather than relying on getattr at build time, so the
+        # value is serialized and an exported checkpoint fully describes its own
+        # graph to whoever loads it next.
+        expansion = kwargs.pop("compensatory_mlp_expansion_factor", 1)
         super().__init__(**kwargs)
         self.rope_parameters = rope_parameters
+        self.compensatory_mlp_expansion_factor = expansion
 
     def _validate_yarn_rope_parameters(self, rope_parameters: dict, ignore_keys: set | None = None) -> None:
         # Transformers 5.8.1's inherited validator reads original context from
@@ -89,13 +126,25 @@ class _Layer(nn.Module):
         self.mlp = (
             _MoE(config) if config.mlp_layer_types[index] == "sparse" else _MLP(config, config.intermediate_size)
         )
+        self.surgery_variant = resolve_surgery_variant(config)
+        if self.surgery_variant == "v4":
+            factor = config.compensatory_mlp_expansion_factor
+            self.compensatory_mlp = _MLP(config, config.hidden_size * factor)
 
     def forward(
         self, hidden: torch.Tensor, *, mask: torch.Tensor, rotary: tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
         attention, _ = self.self_attn(self.input_layernorm(hidden), rotary, mask)
-        hidden = hidden + attention
-        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+        if self.surgery_variant == "v0":
+            hidden = hidden + attention
+            return hidden + self.mlp(self.post_attention_layernorm(hidden))
+        # v1 and v4 share the residual: the MLP reads the block input, not the
+        # post-attention state.
+        output = hidden + attention + self.mlp(self.post_attention_layernorm(hidden))
+        if self.surgery_variant == "v4":
+            # Third branch, no norm, reading the same residual as the other two.
+            output = output + self.compensatory_mlp(hidden)
+        return output
 
 
 class _Model(nn.Module):

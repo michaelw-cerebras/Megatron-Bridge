@@ -10,7 +10,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-from megatron.bridge.models.conversion.param_mapping import AutoMapping
+from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mellum.modeling_mellum.hf_reference import register_hf_fallback
@@ -95,14 +95,39 @@ class MellumBridge(MegatronModelBridge):
         return provider
 
     def mapping_registry(self) -> MegatronMappingRegistry:
-        """Reuse per-expert mappings matching the published Mellum checkpoint."""
-        return Qwen3MoEBridge.mapping_registry(self)
+        """Reuse per-expert mappings, plus surgery variant v4's correction branch.
+
+        The correction mappings are always registered. Conversion tasks are built
+        by walking Megatron's parameters, so for a model without the branch these
+        patterns simply never match, and importing a checkpoint that lacks the
+        Hugging Face side logs a warning and skips rather than failing. That
+        keeps one registry correct for every variant.
+        """
+        base = Qwen3MoEBridge.mapping_registry(self)
+        return MegatronMappingRegistry(
+            *base.mappings,
+            GatedMLPMapping(
+                megatron_param="decoder.layers.*.compensatory_mlp.linear_fc1.weight",
+                gate="model.layers.*.compensatory_mlp.gate_proj.weight",
+                up="model.layers.*.compensatory_mlp.up_proj.weight",
+            ),
+            AutoMapping(
+                megatron_param="decoder.layers.*.compensatory_mlp.linear_fc2.weight",
+                hf_param="model.layers.*.compensatory_mlp.down_proj.weight",
+            ),
+        )
 
     @classmethod
     def megatron_to_hf_config(cls, provider: GPTModelProvider) -> dict:
         """Preserve hybrid attention, head dimension, and YaRN on HF export."""
         result = super().megatron_to_hf_config(provider)
         factor = provider.yarn_rotary_scaling_factor
+        variant = getattr(provider, "surgery_variant_id", None)
+        if variant is not None:
+            # Without these an exported checkpoint would load into the original
+            # sequential graph and silently produce wrong evaluation numbers.
+            result["megatron_bridge_surgery_variant"] = variant
+            result["compensatory_mlp_expansion_factor"] = getattr(provider, "surgery_correction_expansion_factor", 1)
         result.update(
             max_position_embeddings=max(
                 provider.seq_length, math.ceil(factor * provider.yarn_original_max_position_embeddings)

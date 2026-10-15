@@ -124,8 +124,9 @@ wandb:
 run:
   directory: /workspace/ml-olympus/codesign_pretrain/runs/mellum2_thinking_first_run_50B_1007
   save_interval: 1000
+  keep_last_checkpoints: 3
   log_interval: 10
-  resume_checkpoint: null
+  resume_checkpoint: /workspace/ml-olympus/codesign_pretrain/runs/mellum2_thinking_first_run_50B_1007/checkpoints
 
   # Optional absolute optimizer-step limit for a short smoke; LR horizon stays unchanged.
   exit_interval: null

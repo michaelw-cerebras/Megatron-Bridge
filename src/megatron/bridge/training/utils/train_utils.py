@@ -1040,6 +1040,7 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if getattr(config.model, "moe_z_loss_coeff", None) is not None:
             track_names.append("z_loss")
+        track_names.extend(getattr(config.model, "moe_additional_logging_metrics", ()))
 
         if getattr(config.model, "is_hybrid_model", False):
             layers = getattr(config.model, "hybrid_layer_pattern", "").count("E")

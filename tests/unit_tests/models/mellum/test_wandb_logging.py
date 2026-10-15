@@ -40,6 +40,7 @@ def test_maps_real_bridge_logger_without_credentials(modules: tuple[ModuleType, 
     configuration, tracking = modules
     settings = configuration.read_config(SCRIPTS / "config.yaml")
     settings["run"]["directory"] = str(tmp_path)
+    settings["run"]["resume_checkpoint"] = None
     logger = LoggerConfig()
     tracking.apply_wandb_config(logger, settings)
     assert logger.wandb_project == settings["wandb"]["project"]
@@ -130,6 +131,7 @@ def test_fresh_restart_rotates_deleted_id_and_preserves_cache(
     configuration, tracking = modules
     settings = configuration.read_config(SCRIPTS / "config.yaml")
     settings["run"]["directory"] = str(tmp_path)
+    settings["run"]["resume_checkpoint"] = None
     record = tmp_path / "metadata/wandb_run.json"
     record.parent.mkdir()
     original = json.dumps(

@@ -54,21 +54,54 @@ load_wandb_env() {
 
 load_wandb_env
 # The historical folder/container name does not fix the number of nodes.
-# Default to GPU 31 and 32 and 33;
-read -r -a nodes <<< "${MELLUM_NODES:-172.31.223.220 172.31.210.225}"
-# read -r -a nodes <<< "${MELLUM_NODES:-172.31.223.220 172.31.210.225 172.31.208.139}"
+# Current throughput configs target the one available 8xH200 node. Override
+# MELLUM_NODES to scale a compatible config to more nodes.
+read -r -a nodes <<< "${MELLUM_NODES:-172.31.210.225}"
 # Container preparation validates mounts and never replaces existing containers automatically.
 CONTAINER="${MELLUM_CONTAINER:-mellum2_3xh200}"
 IMAGE="${MELLUM_IMAGE:-nvcr.io/nvidia/nemo:26.06}"
+# On these 2 TiB nodes, a 1 TiB cap leaves substantial system headroom.
+# Set this explicitly to match the memory budget granted for the allocation.
+MEMORY_GIB="${MELLUM_MEMORY_GIB-1024}"
+if [[ ! "$MEMORY_GIB" =~ ^[1-9][0-9]{0,4}$ ]]; then
+  echo "MELLUM_MEMORY_GIB must be a positive integer (GiB)" >&2; exit 2
+fi
 REMOTE_REPO="${MELLUM_REMOTE_REPO:-/workspace/ws/Megatron-Bridge}"
 HOST_WS="${MELLUM_HOST_WS:-$(dirname -- "$REPO_ROOT")}"
 HOST_DATA="${MELLUM_HOST_DATA:-/cb/ml-olympus}"
 HOST_RUNS="${MELLUM_HOST_RUNS:-$HOST_DATA/codesign_pretrain/runs}"
 REMOTE_RUNS="${MELLUM_REMOTE_RUNS:-/workspace/ml-olympus/codesign_pretrain/runs}"
-CONFIG="${MELLUM_CONFIG:-$REMOTE_REPO/mw_scripts/mellum2_3xh200/config.yaml}"
 MASTER_ADDR="${MELLUM_MASTER_ADDR:-${nodes[0]}}"
 MASTER_PORT="${MELLUM_MASTER_PORT:-29541}"
-ACTION="${1:---help}"
+ACTION=""
+VARIANT=""
+while (( $# )); do
+  case "$1" in
+    --variant)
+      [[ $# -ge 2 ]] || { echo "--variant requires BASE-vN or THINKING-vN" >&2; exit 2; }
+      VARIANT="$2"; shift 2
+      ;;
+    --prepare-containers|--preflight|--prepare|--dry-run|--network-test|--wandb-check|--train|--status|--stop|--help|-h)
+      [[ -z "$ACTION" ]] || { echo "Specify exactly one action" >&2; exit 2; }
+      ACTION="$1"; shift
+      ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+ACTION="${ACTION:---help}"
+if [[ -n "$VARIANT" ]]; then
+  if [[ -v MELLUM_CONFIG ]]; then
+    echo "Use either --variant or MELLUM_CONFIG, not both" >&2; exit 2
+  fi
+  VARIANT="${VARIANT,,}"
+  case "$VARIANT" in
+    base-v0|base-v1|base-v2|base-v3|base-v3_1|base-v4|thinking-v0|thinking-v1|thinking-v2|thinking-v3|thinking-v3_1|thinking-v4) ;;
+    *) echo "Unknown variant case: $VARIANT" >&2; exit 2 ;;
+  esac
+  CONFIG="$REMOTE_REPO/mw_scripts/mellum2_3xh200/config/$VARIANT.yaml"
+else
+  CONFIG="${MELLUM_CONFIG:-$REMOTE_REPO/mw_scripts/mellum2_3xh200/config/thinking-v0.yaml}"
+fi
 
 if [[ "$HOST_RUNS" != /* || "$HOST_RUNS" == / || "$HOST_RUNS" == *,* || \
       "$REMOTE_RUNS" != /* || "$REMOTE_RUNS" == / || "$REMOTE_RUNS" == *,* ]]; then
@@ -143,7 +176,8 @@ case "$ACTION" in
         remote "$node" mkdir -p -- "$HOST_RUNS"
         remote "$node" docker run -d --network=host --gpus all --name "$CONTAINER" \
           --label megatron-bridge.mellum-bringup=true \
-          --shm-size=64g --ulimit memlock=-1 --ulimit stack=67108864 \
+          --memory "${MEMORY_GIB}g" --memory-swap "${MEMORY_GIB}g" --cgroupns=private \
+          --shm-size=64g --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=262144:262144 \
           --device=/dev/infiniband -e HOME=/workspace -e PYTHONNOUSERSITE=1 \
           -e PIP_CACHE_DIR=/tmp/pip-cache -v "$HOST_WS:/workspace/ws" \
           -v "$HOST_DATA:/workspace/ml-olympus:ro" \
@@ -189,10 +223,13 @@ case "$ACTION" in
     exit "$failed"
     ;;
   --help|-h)
-    echo "Usage: bash launch.sh --prepare-containers|--preflight|--prepare|--dry-run|--network-test|--wandb-check|--train|--status|--stop"
+    echo "Usage: bash launch.sh --variant {base,thinking}-v{0,1,2,3,3_1,4} ACTION"
+    echo "Actions: --prepare-containers|--preflight|--prepare|--dry-run|--network-test|--wandb-check|--train|--status|--stop"
     echo "Overrides: MELLUM_NODES MELLUM_CONTAINER MELLUM_CONFIG MELLUM_HOST_WS MELLUM_HOST_DATA MELLUM_HOST_RUNS MELLUM_REMOTE_RUNS MELLUM_MASTER_PORT"
     echo "Container: $CONTAINER; writable output: $HOST_RUNS -> $REMOTE_RUNS (data stays read-only)"
+    echo "New container memory cap: $MEMORY_GIB GiB; override with MELLUM_MEMORY_GIB to match your allocation."
     echo "Selected nodes (${#nodes[@]} nodes, $((${#nodes[@]} * 8)) GPUs): ${nodes[*]}"
+    echo "Selected config: $CONFIG"
     echo "W&B: automatically read .env beside launch.sh; existing environment variables take precedence."
     echo "MELLUM_ENV_FILE overrides that path; set it empty to disable .env loading. Never put credentials in YAML."
     echo "Training stays in the foreground. Use tmux or nohup as described in user_manual.md."

@@ -69,6 +69,14 @@ class ParallelSettings(TypedDict):
     expert_tensor_parallel_size: int
 
 
+class PerformanceSettings(TypedDict):
+    """Measured kernel/dispatcher choices for one architecture variant."""
+
+    precision: str
+    moe_token_dispatcher_type: str
+    moe_permute_fusion: bool
+
+
 class DatasetSettings(TypedDict):
     """Immutable indexed-data mixture and document-boundary ID."""
 
@@ -82,9 +90,12 @@ class RunSettings(TypedDict):
     """Output, checkpoint and short-run controls."""
 
     directory: str
-    save_interval: int
+    save_interval: int | None
+    keep_last_checkpoints: int
     log_interval: int
     resume_checkpoint: str | None
+    override_checkpoint_scheduler: NotRequired[bool]
+    reset_optimizer_on_resume: NotRequired[bool]
     exit_interval: int | None
 
 
@@ -107,6 +118,7 @@ class TrainingSettings(TypedDict):
     optimizer: OptimizerSettings
     scheduler: SchedulerSettings
     parallelism: ParallelSettings
+    performance: NotRequired[PerformanceSettings]
     dataset: DatasetSettings
     run: RunSettings
     wandb: NotRequired[WandbSettings]
@@ -176,15 +188,24 @@ def read_config(path: Path) -> TrainingSettings:
             "expert_tensor_parallel_size",
         },
         "dataset": {"eod_id", "num_workers", "subsets"},
-        "run": {"directory", "save_interval", "log_interval", "resume_checkpoint", "exit_interval"},
+        "run": {
+            "directory",
+            "save_interval",
+            "keep_last_checkpoints",
+            "log_interval",
+            "resume_checkpoint",
+            "exit_interval",
+        },
     }
     required = set(fields) | {"schema_version"}
-    if not isinstance(config, dict) or set(config) - {"wandb"} != required:
+    if not isinstance(config, dict) or set(config) - {"wandb", "performance"} != required:
         raise ValueError("Expected schema_version and exactly: " + ", ".join(fields))
     if type(config["schema_version"]) is not int or config["schema_version"] != 1:
         raise ValueError("Unsupported schema_version")
     for section, names in fields.items():
         optional = {"reserved_token_check"} if section == "dataset" else set()
+        if section == "run":
+            optional.update({"override_checkpoint_scheduler", "reset_optimizer_on_resume"})
         if not isinstance(config[section], dict) or set(config[section]) - optional != names:
             raise ValueError(f"{section} requires exactly these fields: {sorted(names)}")
     policy = config["dataset"].get("reserved_token_check", "strict")
@@ -205,19 +226,44 @@ def read_config(path: Path) -> TrainingSettings:
         url = urlsplit(tracking["base_url"])
         if url.scheme != "https" or not url.hostname or url.username or url.password or url.query or url.fragment:
             raise ValueError("wandb.base_url must be an HTTPS URL without credentials, query, or fragment")
-    if config["model"]["architecture"] != "original":
-        raise ValueError("Only original Mellum is implemented; surgery variants require a new layer spec")
+    if "performance" in config:
+        performance = config["performance"]
+        names = {"precision", "moe_token_dispatcher_type", "moe_permute_fusion"}
+        if not isinstance(performance, dict) or set(performance) != names:
+            raise ValueError(f"performance requires exactly {sorted(names)}")
+        if performance["precision"] != "bf16":
+            raise ValueError("performance.precision currently supports only 'bf16'")
+        if performance["moe_token_dispatcher_type"] != "alltoall":
+            raise ValueError("performance.moe_token_dispatcher_type currently supports only 'alltoall'")
+        if type(performance["moe_permute_fusion"]) is not bool:
+            raise ValueError("performance.moe_permute_fusion must be a boolean")
+    # Variant ids are validated against the surgery registry in train.py; this only
+    # rejects typos early, before --prepare downloads or a job is queued. The legacy
+    # spellings keep existing run configs working.
+    architecture = config["model"]["architecture"]
+    if not isinstance(architecture, str) or not re.fullmatch(
+        r"v\d+(_\d+)?|original|parallel_attention_moe", architecture
+    ):
+        raise ValueError(
+            "model.architecture must be 'original', a surgery variant id like 'v1' or 'v3_1', or a legacy name"
+        )
     if not isinstance(config["model"]["hf_path"], str) or not config["model"]["hf_path"].strip():
         raise ValueError("model.hf_path must name a Hugging Face repository or local checkpoint")
     for section, names in (
         ("train", fields["train"]),
         ("parallelism", fields["parallelism"]),
-        ("run", {"save_interval", "log_interval"}),
+        ("run", {"log_interval"}),
     ):
         for name in names:
             value = config[section][name]
             if type(value) is not int or value < (0 if name == "seed" else 1):
                 raise ValueError(f"{section}.{name} must be an integer in its valid range")
+    save_interval = config["run"]["save_interval"]
+    if save_interval is not None and (type(save_interval) is not int or save_interval < 1):
+        raise ValueError("run.save_interval must be null or a positive integer")
+    keep_last = config["run"]["keep_last_checkpoints"]
+    if type(keep_last) is not int or keep_last < 1:
+        raise ValueError("run.keep_last_checkpoints must be a positive integer")
     for name in ("eod_id", "num_workers"):
         if type(config["dataset"][name]) is not int or config["dataset"][name] < 0:
             raise ValueError(f"dataset.{name} must be a nonnegative integer")
@@ -242,6 +288,18 @@ def read_config(path: Path) -> TrainingSettings:
             raise ValueError(f"run.{key} must be an absolute path")
     if config["run"]["directory"] is None:
         raise ValueError("run.directory is required")
+    override_checkpoint_scheduler = config["run"].get("override_checkpoint_scheduler", False)
+    if type(override_checkpoint_scheduler) is not bool:
+        raise ValueError("run.override_checkpoint_scheduler must be a boolean")
+    if override_checkpoint_scheduler and config["run"]["resume_checkpoint"] is None:
+        raise ValueError("run.override_checkpoint_scheduler requires resume_checkpoint")
+    reset_optimizer = config["run"].get("reset_optimizer_on_resume", False)
+    if type(reset_optimizer) is not bool:
+        raise ValueError("run.reset_optimizer_on_resume must be a boolean")
+    if reset_optimizer and config["run"]["resume_checkpoint"] is None:
+        raise ValueError("run.reset_optimizer_on_resume requires resume_checkpoint")
+    if reset_optimizer and not override_checkpoint_scheduler:
+        raise ValueError("run.reset_optimizer_on_resume requires override_checkpoint_scheduler")
     limit = config["run"]["exit_interval"]
     if limit is not None and (type(limit) is not int or limit < 1):
         raise ValueError("exit_interval must be null or a positive integer")
@@ -272,8 +330,28 @@ def config_digest(config: TrainingSettings) -> str:
     if semantic["dataset"].get("reserved_token_check", "strict") == "strict":
         semantic["dataset"].pop("reserved_token_check", None)
     semantic["run"].pop("resume_checkpoint")
+    semantic["run"].pop("override_checkpoint_scheduler", None)
+    semantic["run"].pop("reset_optimizer_on_resume", None)
     semantic["run"].pop("exit_interval")
     return hashlib.sha256(json.dumps(semantic, sort_keys=True).encode()).hexdigest()
+
+
+def is_scheduler_recovery(old_config: dict[str, object], new_config: TrainingSettings) -> bool:
+    """Return whether only LR/scheduler and runtime tracking controls changed."""
+    old_semantic = json.loads(json.dumps(old_config))
+    new_semantic = json.loads(json.dumps(new_config))
+    for semantic in (old_semantic, new_semantic):
+        semantic.pop("wandb", None)
+        run = semantic["run"]
+        run.pop("resume_checkpoint", None)
+        run.pop("override_checkpoint_scheduler", None)
+        run.pop("reset_optimizer_on_resume", None)
+        run.pop("exit_interval", None)
+        optimizer = semantic["optimizer"]
+        optimizer.pop("lr", None)
+        optimizer.pop("min_lr", None)
+        semantic.pop("scheduler", None)
+    return old_semantic == new_semantic
 
 
 def validate_parallelism(config: TrainingSettings, *, world_size: int, experts: int) -> int:

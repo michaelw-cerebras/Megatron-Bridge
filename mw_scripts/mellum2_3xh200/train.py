@@ -15,6 +15,7 @@ from configuration import (
     MixtureSnapshot,
     TrainingSettings,
     config_digest,
+    is_scheduler_recovery,
     prepare_mixture,
     read_config,
     validate_parallelism,
@@ -31,8 +32,115 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 
+def _override_optimizer_param_group_schedule(
+    optimizer: object,
+    scheduler: object,
+    *,
+    max_lr: float,
+    min_lr: float,
+    resume_num_steps: int | None = None,
+) -> None:
+    """Replace param-group LR bounds restored by an optimizer checkpoint."""
+    param_groups = getattr(optimizer, "param_groups")
+    for group in param_groups:
+        if group.get("is_decoupled_lr", False):
+            raise ValueError("Scheduler recovery does not support decoupled-LR parameter groups")
+        group["max_lr"] = max_lr
+        group["min_lr"] = min_lr
+    scheduler.max_lr = max_lr
+    scheduler.min_lr = min_lr
+    if resume_num_steps is not None:
+        if scheduler.num_steps != 0:
+            raise ValueError("Fresh optimizer recovery expected a scheduler at step zero")
+        scheduler.step(resume_num_steps)
+    else:
+        # Loading the scheduler already restored num_steps. Reapply that point
+        # on the new bounds without advancing the schedule.
+        scheduler.step(0)
+
+
+def _scheduler_recovery_callback(*, max_lr: float, min_lr: float, reset_optimizer: bool) -> object:
+    """Build a callback that repairs LR bounds after optimizer-state loading."""
+    from megatron.bridge.training.callbacks import Callback
+
+    class SchedulerRecoveryCallback(Callback):
+        def on_data_init_start(self, context: object) -> None:
+            optimizer = getattr(context, "optimizer")
+            scheduler = getattr(context, "scheduler")
+            if optimizer is None or scheduler is None:
+                raise RuntimeError("Scheduler recovery requires an optimizer and scheduler")
+            resume_num_steps = None
+            if reset_optimizer:
+                resume_num_steps = getattr(context, "state").train_state.consumed_train_samples
+            _override_optimizer_param_group_schedule(
+                optimizer,
+                scheduler,
+                max_lr=max_lr,
+                min_lr=min_lr,
+                resume_num_steps=resume_num_steps,
+            )
+            LOGGER.info(
+                "Applied recovered LR schedule at step %d: max_lr=%g min_lr=%g effective_lr=%g",
+                scheduler.num_steps,
+                max_lr,
+                min_lr,
+                optimizer.param_groups[0]["lr"],
+            )
+
+    return SchedulerRecoveryCallback()
+
+
+def _apply_architecture(cfg: "ConfigContainer", settings: TrainingSettings) -> None:
+    """Select the decoder computation graph named by the checkpoint's surgery manifest.
+
+    The weights of a surgery variant are byte-identical to the original, so the
+    manifest is the only record of which graph to build. Reading it here, rather
+    than trusting the YAML alone, keeps a config and a checkpoint from drifting
+    apart into a silently wrong graph.
+
+    Args:
+        cfg: Recipe config to mutate in place.
+        settings: Validated YAML settings.
+
+    Raises:
+        ValueError: If the manifest is missing, disagrees with the YAML, or the
+            initial import would randomly initialize weights.
+    """
+    from megatron.bridge.models.surgery import (
+        ARCHITECTURE_FIELD,
+        apply_surgery,
+        legacy_architecture,
+        manifest_variant,
+        read_manifest,
+    )
+
+    architecture = settings["model"]["architecture"]
+    if architecture in {"original", "v0"}:
+        return
+    hf_path = Path(settings["model"]["hf_path"])
+    if not hf_path.is_dir():
+        raise ValueError(f"Surgery variant {architecture} requires a local derived Hugging Face directory")
+
+    manifest = read_manifest(hf_path)
+    variant_id, params = manifest_variant(manifest)
+    if architecture not in {variant_id, legacy_architecture(variant_id)}:
+        raise ValueError(f"model.architecture is {architecture!r} but {hf_path} was produced for variant {variant_id}")
+    hf_config = json.loads((hf_path / "config.json").read_text())
+    if hf_config.get(ARCHITECTURE_FIELD) != legacy_architecture(variant_id):
+        raise ValueError(f"Derived Hugging Face config is missing the {variant_id} surgery marker")
+    if settings["run"]["resume_checkpoint"] is None and cfg.model.perform_initialization:
+        raise ValueError("Initial surgery HF import must disable Megatron random initialization")
+
+    from megatron.bridge.models.mellum.modeling_mellum.layer_specs import mellum_layer_spec
+
+    described = apply_surgery(cfg.model, base_spec=mellum_layer_spec, variant=variant_id, params=params)
+    LOGGER.info("Surgery: %s", json.dumps(described))
+
+
 def build_config(settings: TrainingSettings, mixture: MixtureSnapshot, *, world_size: int) -> "ConfigContainer":
     """Construct a BF16 continued-pretraining recipe with explicit resume semantics."""
+    from compact_data import compact_dataset_config
+
     from megatron.bridge.recipes.mellum import mellum_pretrain_config
 
     resume = settings["run"]["resume_checkpoint"]
@@ -46,6 +154,7 @@ def build_config(settings: TrainingSettings, mixture: MixtureSnapshot, *, world_
     ):
         raise ValueError("Existing checkpoints require explicit resume_checkpoint or a new run.directory")
     cfg = mellum_pretrain_config(mixture["hf_snapshot"], load_weights=resume is None)
+    cfg.dataset = compact_dataset_config(cfg.dataset)
     cfg.dist.distributed_timeout_minutes = 180
     if settings["dataset"]["eod_id"] >= cfg.model.vocab_size:
         raise ValueError("Dataset EOD is outside the model vocabulary")
@@ -54,6 +163,15 @@ def build_config(settings: TrainingSettings, mixture: MixtureSnapshot, *, world_
         if not hasattr(cfg.model, name):
             raise ValueError(f"Unknown model parallelism field: {name}")
         setattr(cfg.model, name, value)
+    performance = settings.get("performance")
+    if performance is not None:
+        cfg.mixed_precision = "bf16_mixed"
+        cfg.model.moe_token_dispatcher_type = performance["moe_token_dispatcher_type"]
+        cfg.model.moe_flex_dispatcher_backend = None
+        cfg.model.moe_permute_fusion = performance["moe_permute_fusion"]
+    # Apply surgery only after all graph requirements (notably PP and dispatcher
+    # overlap) have their final YAML values.
+    _apply_architecture(cfg, settings)
     cfg.model.sequence_parallel = cfg.model.tensor_model_parallel_size > 1
     cfg.train.global_batch_size = settings["train"]["global_batch_size"]
     cfg.train.micro_batch_size = settings["train"]["micro_batch_size"]
@@ -82,6 +200,9 @@ def build_config(settings: TrainingSettings, mixture: MixtureSnapshot, *, world_
     cfg.dataset.skip_getting_attention_mask_from_dataset = True
     cfg.dataset.fast_cache_load = False
     cfg.dataset.defer_npy_index_mmap = False
+    # File reads keep token access bounded instead of faulting long-lived bin
+    # mappings in every worker. The sampling .npy indices remain read-only mmap.
+    cfg.dataset.mmap_bin_files = False
     cfg.dataset.num_workers = settings["dataset"]["num_workers"]
     cfg.validation.eval_interval = None
     cfg.validation.eval_iters = 0
@@ -95,18 +216,21 @@ def build_config(settings: TrainingSettings, mixture: MixtureSnapshot, *, world_
     cfg.scheduler.lr_warmup_init = 0.0
     cfg.scheduler.start_weight_decay = cfg.optimizer.weight_decay
     cfg.scheduler.end_weight_decay = cfg.optimizer.weight_decay
-    cfg.scheduler.override_opt_param_scheduler = False
-    cfg.scheduler.use_checkpoint_opt_param_scheduler = resume is not None
+    override_checkpoint_scheduler = settings["run"].get("override_checkpoint_scheduler", False)
+    reset_optimizer = settings["run"].get("reset_optimizer_on_resume", False)
+    cfg.scheduler.override_opt_param_scheduler = override_checkpoint_scheduler
+    cfg.scheduler.use_checkpoint_opt_param_scheduler = resume is not None and not override_checkpoint_scheduler
     directory = Path(settings["run"]["directory"])
     cfg.checkpoint.save = str(directory / "checkpoints")
     cfg.checkpoint.load = resume
     cfg.checkpoint.pretrained_checkpoint = None
-    cfg.checkpoint.load_optim = resume is not None
+    cfg.checkpoint.load_optim = resume is not None and not reset_optimizer
     cfg.checkpoint.load_rng = resume is not None
     cfg.checkpoint.save_optim = True
     cfg.checkpoint.save_rng = True
     cfg.checkpoint.finetune = False
     cfg.checkpoint.save_interval = settings["run"]["save_interval"]
+    cfg.checkpoint.most_recent_k = settings["run"]["keep_last_checkpoints"]
     cfg.checkpoint.ckpt_format = "torch_dist"
     cfg.checkpoint.async_save = False
     cfg.checkpoint.fully_parallel_save = True
@@ -166,7 +290,14 @@ def main() -> None:
         if snapshot.exists():
             mixture = json.loads(snapshot.read_text())
             if mixture["config_digest"] != config_digest(settings):
-                raise ValueError("Run already has a different immutable mixture/config; choose a new run.directory")
+                if not (
+                    settings["run"].get("override_checkpoint_scheduler", False)
+                    and is_scheduler_recovery(mixture["config"], settings)
+                ):
+                    raise ValueError("Run already has a different immutable mixture/config; choose a new run.directory")
+                LOGGER.warning("Refreshing the frozen snapshot for an explicit LR/scheduler recovery")
+                mixture["config"] = settings
+                mixture["config_digest"] = config_digest(settings)
             validate_snapshot_files(mixture)
         else:
             if not Path(settings["model"]["hf_path"]).is_dir():
@@ -199,7 +330,16 @@ def main() -> None:
     from megatron.bridge.training.gpt_step import forward_step
     from megatron.bridge.training.pretrain import pretrain
 
-    pretrain(config=cfg, forward_step_func=forward_step)
+    callbacks = None
+    if settings["run"].get("override_checkpoint_scheduler", False):
+        callbacks = [
+            _scheduler_recovery_callback(
+                max_lr=settings["optimizer"]["lr"],
+                min_lr=settings["optimizer"]["min_lr"],
+                reset_optimizer=settings["run"].get("reset_optimizer_on_resume", False),
+            )
+        ]
+    pretrain(config=cfg, forward_step_func=forward_step, callbacks=callbacks)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 export TOKENIZERS_PARALLELISM=false
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Each shard retains several index/mmap handles; use the granted hard limit.
+ulimit -Sn "$(ulimit -Hn)"
 
 # Select AWS OFI only when explicitly requested. A visible EFA device alone
 # does not prove NCCL is using EFA. The preflight reports the provider/plugin.
@@ -35,8 +37,22 @@ rank="${1:-0}"
 pid_file="$run_dir/node_${rank}.pid"
 nnodes="${2:?Expected node count from launch.sh}"
 
+require_memory_limit() {
+  local limit cgroup_dir="${1:-/sys/fs/cgroup}"
+  if [[ ! -r "$cgroup_dir/memory.max" ]]; then
+    echo "A container-private cgroup-v2 memory limit is required" >&2; return 1
+  fi
+  limit="$(< "$cgroup_dir/memory.max")"
+  if [[ ! "$limit" =~ ^[0-9]+$ || "$limit" == 0 ]]; then
+    echo "Refusing GPU launch in an unlimited-memory container. Recreate it with MELLUM_MEMORY_GIB set to your allocation budget." >&2
+    return 1
+  fi
+  echo "node $rank: container CPU memory limit: $limit bytes"
+}
+
 case "$action" in
   preflight)
+    require_memory_limit
     mkdir -p -- "$run_dir"
     write_probe="$(mktemp "$run_dir/.write-probe-node_${rank}.XXXXXX")"
     unlink -- "$write_probe"
@@ -64,6 +80,7 @@ case "$action" in
     else echo "node $rank: stale PID file"; fi
     ;;
   train|network-test)
+    require_memory_limit
     master="${3:?Expected master address}"
     port="${4:?Expected master port}"
     mkdir -p "$run_dir/logs"
@@ -90,8 +107,13 @@ case "$action" in
       --master_addr="$master" --master_port="$port" --max_restarts=0 \
       "${program[@]}" > "$log_file" 2>&1 &
     pid=$!
+    monitor_pid=""
     printf '%s %s\n' "$pid" "${MELLUM_LAUNCH_ID:-manual}" > "$pid_file"
     cleanup() {
+      if [[ -n "$monitor_pid" ]]; then
+        kill -TERM "$monitor_pid" 2>/dev/null || true
+        wait "$monitor_pid" 2>/dev/null || true
+      fi
       if [[ -f "$pid_file" ]]; then
         read -r recorded_pid owner < "$pid_file"
         if [[ "$recorded_pid" == "$pid" ]]; then unlink "$pid_file"; fi
@@ -100,6 +122,13 @@ case "$action" in
     terminate() { kill -TERM -- "-$pid" 2>/dev/null || true; }
     trap terminate TERM INT HUP
     trap 'terminate; cleanup' EXIT
+    if [[ "$action" == train ]]; then
+      "${python_cmd[@]}" "$SCRIPT_DIR/memory_monitor.py" \
+        --output "$run_dir/logs/cpu_memory_node_${rank}.jsonl" \
+        --node-rank "$rank" --launch-id "${MELLUM_LAUNCH_ID:-manual}" \
+        > "$run_dir/logs/memory_monitor_node_${rank}.log" 2>&1 &
+      monitor_pid=$!
+    fi
     wait "$pid"
     ;;
   *) echo "Unknown action: $action" >&2; exit 2 ;;
