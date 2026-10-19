@@ -1042,8 +1042,10 @@ class MegatronModelBridge(
 
         _hf_import_cache: Dict[str, torch.Tensor] = {}
         for task in self._with_progress_tracking(hf_to_megatron_tasks, description):
-            # None means megatron module not on current rank, skip if this task is not going to happen
-            if task.megatron_module is None:
+            # Missing source weights intentionally leave an empty task. This is
+            # how parameter-adding model surgery keeps its initialized tensors
+            # while importing every inherited tensor from the source checkpoint.
+            if task is None or task.megatron_module is None:
                 continue
             # 1) Fetch source tensor(s) from HF state dict, with caching for grouped mappings
             hf_param_key = str(task.mapping.hf_param)

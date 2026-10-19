@@ -158,6 +158,15 @@ class TestHFNameSuffixMapping:
 
 
 class TestFp8ParamExport:
+    def test_load_weights_skips_tasks_for_missing_source_parameters(self, monkeypatch):
+        bridge = DummyBridge()
+        monkeypatch.setattr(DummyBridge, "build_conversion_tasks", lambda self, *_a, **_k: [None])
+        monkeypatch.setattr(DummyBridge, "_with_progress_tracking", lambda self, tasks, *_a, **_k: tasks)
+        monkeypatch.setattr(DummyBridge, "_broadcast_shared_embeddings", lambda self, *_a, **_k: None)
+        hf_pretrained = SimpleNamespace(state={}, model_name_or_path="dummy")
+        models = [SimpleNamespace()]
+        assert bridge.load_weights_hf_to_megatron(hf_pretrained, models) is models
+
     @pytest.mark.parametrize(
         "export_weight_dtype, expect_unquantized",
         [("fp8", True), ("bf16", False)],

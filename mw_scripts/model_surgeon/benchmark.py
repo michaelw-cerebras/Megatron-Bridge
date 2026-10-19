@@ -78,7 +78,7 @@ def main() -> None:
         raise FileNotFoundError(args.mixture_snapshot)
     if args.ep_overlap and args.ep == 1:
         raise ValueError("EP overlap requires EP > 1")
-    if args.ep_overlap and args.variant in {"v2", "v3", "v3_1"}:
+    if args.ep_overlap and args.variant in {"v2", "v3", "v3_1", "v3_2", "v3_3"}:
         raise ValueError(f"{args.variant} executes MoE blocks across layer boundaries and forbids EP overlap")
 
     mixture = json.loads(args.mixture_snapshot.read_text())

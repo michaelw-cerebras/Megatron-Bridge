@@ -35,6 +35,7 @@ matching completed outputs, and resumes incomplete DataTrove tasks automatically
 Environment overrides:
   HEURISTICS_ROOT          Heuristics-filtered source root
   DEDUPED_ROOT             Deduplicated source root
+  RAW_HF_ROOT              Materialized Hugging Face dataset root
   OUTPUT_ROOT              Tokenized output root
   TOKENIZER                Local tokenizer directory/tokenizer.json, or HF ID
   TOKENIZER_REVISION       Tokenizer revision (default: main)
@@ -82,6 +83,7 @@ fi
 
 HEURISTICS_ROOT="${HEURISTICS_ROOT:-/cb/ml-olympus/codesign_pretrain/heuristics_filtered_datasets}"
 DEDUPED_ROOT="${DEDUPED_ROOT:-/cb/ml-olympus/codesign_pretrain/deduped_datasets}"
+RAW_HF_ROOT="${RAW_HF_ROOT:-/cb/ml-olympus/codesign_pretrain/raw_hf_datasets}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/cb/ml-olympus/codesign_pretrain/tokenized/mellum2}"
 TOKENIZER="${TOKENIZER:-JetBrains/Mellum2-12B-A2.5B-Base}"
 TOKENIZER_REVISION="${TOKENIZER_REVISION:-main}"
@@ -132,7 +134,7 @@ if [[ ! "$STACK_V3_SEED" =~ ^-?[0-9]+$ ]]; then
   echo "STOP: STACK_V3_SEED must be an integer, got: $STACK_V3_SEED" >&2
   exit 2
 fi
-for input_root in "$HEURISTICS_ROOT" "$DEDUPED_ROOT"; do
+for input_root in "$HEURISTICS_ROOT" "$DEDUPED_ROOT" "$RAW_HF_ROOT"; do
   if [[ ! -d "$input_root" ]]; then
     echo "STOP: input root does not exist: $input_root" >&2
     exit 1
@@ -163,7 +165,7 @@ if [[ "$ALLOW_INCOMPLETE_INPUT" != "0" && "$ALLOW_INCOMPLETE_INPUT" != "1" ]]; t
   exit 2
 fi
 
-temporary_file_count="$(find "$HEURISTICS_ROOT" "$DEDUPED_ROOT" -type f -name '*.tmp' -print | wc -l)"
+temporary_file_count="$(find "$HEURISTICS_ROOT" "$DEDUPED_ROOT" "$RAW_HF_ROOT" -type f -name '*.tmp' -print | wc -l)"
 if (( temporary_file_count > 0 )); then
   if [[ "$action" == "dry-run" ]]; then
     echo "WARNING: found $temporary_file_count source .tmp files; a real run will stop by default." >&2
@@ -205,6 +207,7 @@ dataset_specs=(
   "heuristics|Ultra-FineWeb-L3/data/ultrafineweb_zh_l3|Ultra-FineWeb-L3/ultrafineweb_zh_l3|content|*.parquet|identity"
   "heuristics|finepdfs|finepdfs|text|*.parquet|identity"
   "heuristics|stack-v3-train/data|stack-v3-train|text|*.parquet|stack-v3"
+  "raw_hf|Puro-2B/phase2|Puro-2B/phase2|text|*.parquet|identity"
   # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Legal-v1|Nemotron-Pretraining-Legal-v1|text|*.parquet|identity"
   # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Math-Textbooks|Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Math-Textbooks|text|*.parquet|identity"
   # "deduped|puffer_exact_specialized_v1/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-STEM-SFT|Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-STEM-SFT|text|*.parquet|identity"
@@ -371,6 +374,7 @@ fi
 
 echo "HEURISTICS_ROOT: $HEURISTICS_ROOT"
 echo "DEDUPED_ROOT: $DEDUPED_ROOT"
+echo "RAW_HF_ROOT: $RAW_HF_ROOT"
 echo "OUTPUT_ROOT: $OUTPUT_ROOT"
 echo "TOKENIZER: $TOKENIZER@$TOKENIZER_REVISION"
 echo "EOS_TOKEN: $EOS_TOKEN"
@@ -388,6 +392,7 @@ for spec in "${dataset_specs[@]}"; do
   case "$source_root_name" in
     heuristics) source_root="$HEURISTICS_ROOT" ;;
     deduped) source_root="$DEDUPED_ROOT" ;;
+    raw_hf) source_root="$RAW_HF_ROOT" ;;
     *) echo "STOP: unknown source root: $source_root_name" >&2; exit 2 ;;
   esac
   input_folder="$source_root/$source_relative"

@@ -18,12 +18,14 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention, Qwen3MoeRMSNorm
 
+from megatron.bridge.models.surgery.manifest import resolve_variant_reference
+
 
 # Graphs this reference can reproduce. Cross-layer variants (v2, v3, v3_1)
 # rearrange across layer boundaries and are NOT expressible in this per-layer
 # class; loading one must fail rather than quietly run the sequential graph and
 # report wrong evaluation numbers.
-SUPPORTED_SURGERY_VARIANTS = frozenset({"v0", "v1", "v4"})
+SUPPORTED_SURGERY_VARIANTS = frozenset({"v0", "v1", "v1_1"})
 _LEGACY_ARCHITECTURE_TO_VARIANT = {"original": "v0", "parallel_attention_moe": "v1"}
 
 
@@ -43,6 +45,7 @@ def resolve_surgery_variant(config: "PretrainedConfig") -> str:
     if variant is None:
         legacy = getattr(config, "megatron_bridge_architecture", None)
         variant = _LEGACY_ARCHITECTURE_TO_VARIANT.get(str(legacy), "v0") if legacy else "v0"
+    variant = resolve_variant_reference(str(variant))
     if variant not in SUPPORTED_SURGERY_VARIANTS:
         raise ValueError(
             f"This Mellum reference implements {sorted(SUPPORTED_SURGERY_VARIANTS)} but the checkpoint "
@@ -60,13 +63,8 @@ class MellumConfig(PretrainedConfig):
         # Base PretrainedConfig validates a single RoPE dictionary before it has
         # retained custom layer_types. Preserve Mellum's nested dictionaries.
         rope_parameters = kwargs.pop("rope_parameters", None)
-        # Default explicitly rather than relying on getattr at build time, so the
-        # value is serialized and an exported checkpoint fully describes its own
-        # graph to whoever loads it next.
-        expansion = kwargs.pop("compensatory_mlp_expansion_factor", 1)
         super().__init__(**kwargs)
         self.rope_parameters = rope_parameters
-        self.compensatory_mlp_expansion_factor = expansion
 
     def _validate_yarn_rope_parameters(self, rope_parameters: dict, ignore_keys: set | None = None) -> None:
         # Transformers 5.8.1's inherited validator reads original context from
@@ -88,6 +86,19 @@ class _MLP(nn.Module):
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.down_proj(torch.nn.functional.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+
+
+class _CompensatoryMLP(nn.Module):
+    """Ivan-style normalized, non-gated hidden-width correction branch."""
+
+    def __init__(self, config: MellumConfig) -> None:
+        super().__init__()
+        self.norm = Qwen3MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.up_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.down_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(torch.nn.functional.silu(self.up_proj(self.norm(hidden))))
 
 
 class _MoE(nn.Module):
@@ -127,9 +138,8 @@ class _Layer(nn.Module):
             _MoE(config) if config.mlp_layer_types[index] == "sparse" else _MLP(config, config.intermediate_size)
         )
         self.surgery_variant = resolve_surgery_variant(config)
-        if self.surgery_variant == "v4":
-            factor = config.compensatory_mlp_expansion_factor
-            self.compensatory_mlp = _MLP(config, config.hidden_size * factor)
+        if self.surgery_variant == "v1_1":
+            self.compensatory_mlp = _CompensatoryMLP(config)
 
     def forward(
         self, hidden: torch.Tensor, *, mask: torch.Tensor, rotary: tuple[torch.Tensor, torch.Tensor]
@@ -138,11 +148,11 @@ class _Layer(nn.Module):
         if self.surgery_variant == "v0":
             hidden = hidden + attention
             return hidden + self.mlp(self.post_attention_layernorm(hidden))
-        # v1 and v4 share the residual: the MLP reads the block input, not the
+        # v1 and v1_1 share the residual: the MLP reads the block input, not the
         # post-attention state.
         output = hidden + attention + self.mlp(self.post_attention_layernorm(hidden))
-        if self.surgery_variant == "v4":
-            # Third branch, no norm, reading the same residual as the other two.
+        if self.surgery_variant == "v1_1":
+            # Third branch has its own norm and reads the shared residual.
             output = output + self.compensatory_mlp(hidden)
         return output
 

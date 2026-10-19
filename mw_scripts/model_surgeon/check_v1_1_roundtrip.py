@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""GPU check: a v4 Megatron model exports to HF, reloads, and agrees on logits.
+"""GPU check: a v1_1 Megatron model exports to HF, reloads, and agrees on logits.
 
 CPU unit tests cover the routing of the graph and the save/reload contract on
 the Hugging Face side. What they cannot reach is the part other teams depend
@@ -11,7 +11,7 @@ Hugging Face names and reproduce the same logits after a reload.
 Run on one GPU::
 
     PYTHONPATH=/workspace/ws/Megatron-Bridge/src \\
-    uv run python mw_scripts/model_surgeon/check_v4_roundtrip.py
+    uv run python mw_scripts/model_surgeon/check_v1_1_roundtrip.py
 """
 
 from __future__ import annotations
@@ -54,8 +54,7 @@ TOY_HF_CONFIG = {
     # marker has to be present on the checkpoint being trained from. In the
     # real pipeline surgeon.py writes it into the derived directory; this toy
     # config stands in for that derived directory.
-    "megatron_bridge_surgery_variant": "v4",
-    "compensatory_mlp_expansion_factor": 1,
+    "megatron_bridge_surgery_variant": "v1_1",
     # The bridge requires Mellum's hybrid RoPE: default on sliding layers, YaRN
     # on full-attention layers. A toy config must keep that shape.
     "rope_parameters": {
@@ -74,7 +73,7 @@ TOY_HF_CONFIG = {
 
 
 def main() -> None:
-    """Build a toy v4 Megatron model, export it, reload it, and compare."""
+    """Build a toy v1_1 Megatron model, export it, reload it, and compare."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keep", type=Path, help="Keep the exported checkpoint at this path")
     args = parser.parse_args()
@@ -95,7 +94,7 @@ def main() -> None:
     provider.expert_model_parallel_size = 1
     provider.perform_initialization = True
 
-    described = apply_surgery(provider, base_spec=mellum_layer_spec, variant="v4")
+    described = apply_surgery(provider, base_spec=mellum_layer_spec, variant="v1_1")
     LOGGER.info("Surgery: %s", described)
     provider.finalize()
     model = provider.provide_distributed_model(wrap_with_ddp=False)
@@ -107,14 +106,14 @@ def main() -> None:
     assert set(trainable) == set(correction_params), "freezing did not isolate the correction branch"
 
     with tempfile.TemporaryDirectory() as temporary:
-        export_dir = Path(args.keep) if args.keep else Path(temporary) / "v4-hf"
+        export_dir = Path(args.keep) if args.keep else Path(temporary) / "v1_1-hf"
         bridge.save_hf_pretrained(model, str(export_dir))
         LOGGER.info("Exported to %s", export_dir)
 
         exported_config = AutoConfig.from_pretrained(export_dir)
         variant = resolve_surgery_variant(exported_config)
-        assert variant == "v4", (
-            f"exported config selects {variant!r}, not v4. The source HF config must carry the\n"
+        assert variant == "v1_1", (
+            f"exported config selects {variant!r}, not v1_1. The source HF config must carry the\n"
             "surgery marker: save_hf_pretrained passes it through verbatim. Export against the\n"
             "surgeon-derived directory, not a stock Mellum config."
         )
@@ -129,7 +128,7 @@ def main() -> None:
             logits = reloaded(tokens).logits
         assert torch.isfinite(logits).all(), "reloaded model produced non-finite logits"
         LOGGER.info(
-            "PASS: %d correction tensors exported, config selects v4, reloaded logits finite %s",
+            "PASS: %d correction tensors exported, config selects v1_1, reloaded logits finite %s",
             len(exported_keys),
             tuple(logits.shape),
         )

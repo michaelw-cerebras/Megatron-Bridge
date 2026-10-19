@@ -37,6 +37,18 @@ ARCHITECTURE_FIELD = "megatron_bridge_architecture"
 SCHEMA_VERSION = 2
 ARTIFACT_FORMAT = "huggingface_safetensors"
 
+# These aliases are read-only compatibility for artifacts produced before the
+# 2026-10 naming cleanup. New manifests always write the canonical identifier.
+VARIANT_ALIASES: dict[str, str] = {
+    "v1.1": "v1_1",
+    "v3.1": "v3_1",
+    "v3.2": "v3_2",
+    "v3.3": "v3_3",
+    "v4": "v1_1",
+    "v5_1": "v3_2",
+    "v5_2": "v3_3",
+}
+
 # v1 wrote a single architecture string. Keep both directions of the mapping so
 # checkpoints produced before the registry existed still resolve to a variant.
 LEGACY_ARCHITECTURE_BY_VARIANT: dict[str, str] = {
@@ -44,6 +56,36 @@ LEGACY_ARCHITECTURE_BY_VARIANT: dict[str, str] = {
     "v1": "parallel_attention_moe",
 }
 VARIANT_BY_LEGACY_ARCHITECTURE: dict[str, str] = {value: key for key, value in LEGACY_ARCHITECTURE_BY_VARIANT.items()}
+
+
+def canonical_variant_id(variant_id: str) -> str:
+    """Return the canonical machine identifier for a variant name.
+
+    Args:
+        variant_id: Canonical, dotted-display, or pre-migration identifier.
+
+    Returns:
+        The canonical underscore-form identifier.
+    """
+    return VARIANT_ALIASES.get(variant_id, variant_id)
+
+
+def resolve_variant_reference(value: str) -> str:
+    """Resolve an id or legacy architecture marker to a canonical variant id.
+
+    Args:
+        value: Variant id, legacy architecture name, or ``surgery_<id>`` marker.
+
+    Returns:
+        The canonical variant identifier, or the unchanged unknown value so the
+        registry can report it consistently.
+    """
+    legacy = VARIANT_BY_LEGACY_ARCHITECTURE.get(value)
+    if legacy is not None:
+        return legacy
+    if value.startswith("surgery_"):
+        value = value.removeprefix("surgery_")
+    return canonical_variant_id(value)
 
 
 def legacy_architecture(variant_id: str) -> str:
@@ -55,7 +97,8 @@ def legacy_architecture(variant_id: str) -> str:
     Returns:
         The legacy string, or ``"surgery_<id>"`` for variants added after v1.
     """
-    return LEGACY_ARCHITECTURE_BY_VARIANT.get(variant_id, f"surgery_{variant_id}")
+    canonical = canonical_variant_id(variant_id)
+    return LEGACY_ARCHITECTURE_BY_VARIANT.get(canonical, f"surgery_{canonical}")
 
 
 def build_manifest(
@@ -149,7 +192,12 @@ def read_manifest(hf_dir: Path) -> dict[str, Any]:
         variant = manifest.get("variant")
         if not isinstance(variant, dict) or not isinstance(variant.get("id"), str):
             raise ValueError(f"Surgery manifest {path} has no variant identifier")
-        return manifest
+        canonical = canonical_variant_id(variant["id"])
+        if canonical == variant["id"]:
+            return manifest
+        normalized = dict(manifest)
+        normalized["variant"] = {**variant, "id": canonical}
+        return normalized
     if version == 1:
         architecture = manifest.get("target_architecture")
         variant_id = VARIANT_BY_LEGACY_ARCHITECTURE.get(str(architecture))

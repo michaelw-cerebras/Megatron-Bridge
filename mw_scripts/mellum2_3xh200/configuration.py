@@ -75,6 +75,8 @@ class PerformanceSettings(TypedDict):
     precision: str
     moe_token_dispatcher_type: str
     moe_permute_fusion: bool
+    recompute_method: NotRequired[str]
+    recompute_num_layers: NotRequired[int]
 
 
 class DatasetSettings(TypedDict):
@@ -229,14 +231,24 @@ def read_config(path: Path) -> TrainingSettings:
     if "performance" in config:
         performance = config["performance"]
         names = {"precision", "moe_token_dispatcher_type", "moe_permute_fusion"}
-        if not isinstance(performance, dict) or set(performance) != names:
-            raise ValueError(f"performance requires exactly {sorted(names)}")
+        optional = {"recompute_method", "recompute_num_layers"}
+        if not isinstance(performance, dict) or set(performance) - optional != names:
+            raise ValueError(f"performance requires exactly {sorted(names)} and optionally {sorted(optional)}")
         if performance["precision"] != "bf16":
             raise ValueError("performance.precision currently supports only 'bf16'")
         if performance["moe_token_dispatcher_type"] != "alltoall":
             raise ValueError("performance.moe_token_dispatcher_type currently supports only 'alltoall'")
         if type(performance["moe_permute_fusion"]) is not bool:
             raise ValueError("performance.moe_permute_fusion must be a boolean")
+        has_recompute_method = "recompute_method" in performance
+        has_recompute_layers = "recompute_num_layers" in performance
+        if has_recompute_method != has_recompute_layers:
+            raise ValueError("performance.recompute_method and recompute_num_layers must be set together")
+        if has_recompute_method:
+            if performance["recompute_method"] not in {"block", "uniform"}:
+                raise ValueError("performance.recompute_method must be 'block' or 'uniform'")
+            if type(performance["recompute_num_layers"]) is not int or performance["recompute_num_layers"] < 1:
+                raise ValueError("performance.recompute_num_layers must be a positive integer")
     # Variant ids are validated against the surgery registry in train.py; this only
     # rejects typos early, before --prepare downloads or a job is queued. The legacy
     # spellings keep existing run configs working.
@@ -333,6 +345,11 @@ def config_digest(config: TrainingSettings) -> str:
     semantic["run"].pop("override_checkpoint_scheduler", None)
     semantic["run"].pop("reset_optimizer_on_resume", None)
     semantic["run"].pop("exit_interval")
+    # Recompute changes only activation storage, not the data/model/optimizer
+    # semantics. Allow adding memory headroom when resuming an OOMed run.
+    if "performance" in semantic:
+        semantic["performance"].pop("recompute_method", None)
+        semantic["performance"].pop("recompute_num_layers", None)
     return hashlib.sha256(json.dumps(semantic, sort_keys=True).encode()).hexdigest()
 
 

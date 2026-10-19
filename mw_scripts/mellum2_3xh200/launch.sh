@@ -94,8 +94,10 @@ if [[ -n "$VARIANT" ]]; then
     echo "Use either --variant or MELLUM_CONFIG, not both" >&2; exit 2
   fi
   VARIANT="${VARIANT,,}"
+  # Dotted names are the human-facing labels; filenames and registry ids use underscores.
+  VARIANT="${VARIANT//./_}"
   case "$VARIANT" in
-    base-v0|base-v1|base-v2|base-v3|base-v3_1|base-v4|thinking-v0|thinking-v1|thinking-v2|thinking-v3|thinking-v3_1|thinking-v4) ;;
+    base-v0|base-v1|base-v2|base-v3|base-v3_1|base-v1_1|base-v3_2|base-v3_3|thinking-v0|thinking-v1|thinking-v2|thinking-v3|thinking-v3_1|thinking-v1_1) ;;
     *) echo "Unknown variant case: $VARIANT" >&2; exit 2 ;;
   esac
   CONFIG="$REMOTE_REPO/mw_scripts/mellum2_3xh200/config/$VARIANT.yaml"
@@ -223,7 +225,9 @@ case "$ACTION" in
     exit "$failed"
     ;;
   --help|-h)
-    echo "Usage: bash launch.sh --variant {base,thinking}-v{0,1,2,3,3_1,4} ACTION"
+    echo "Usage: bash launch.sh --variant CASE ACTION"
+    echo "Cases: base-v{0,1,1.1,2,3,3.1,3.2,3.3}; thinking-v{0,1,1.1,2,3,3.1}"
+    echo "Dotted labels and underscore ids are both accepted (for example base-v3.3 or base-v3_3)."
     echo "Actions: --prepare-containers|--preflight|--prepare|--dry-run|--network-test|--wandb-check|--train|--status|--stop"
     echo "Overrides: MELLUM_NODES MELLUM_CONTAINER MELLUM_CONFIG MELLUM_HOST_WS MELLUM_HOST_DATA MELLUM_HOST_RUNS MELLUM_REMOTE_RUNS MELLUM_MASTER_PORT"
     echo "Container: $CONTAINER; writable output: $HOST_RUNS -> $REMOTE_RUNS (data stays read-only)"

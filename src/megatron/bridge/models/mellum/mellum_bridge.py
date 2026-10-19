@@ -10,7 +10,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-from megatron.bridge.models.conversion.param_mapping import AutoMapping, GatedMLPMapping
+from megatron.bridge.models.conversion.param_mapping import AutoMapping
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.mellum.modeling_mellum.hf_reference import register_hf_fallback
@@ -95,7 +95,7 @@ class MellumBridge(MegatronModelBridge):
         return provider
 
     def mapping_registry(self) -> MegatronMappingRegistry:
-        """Reuse per-expert mappings, plus surgery variant v4's correction branch.
+        """Reuse per-expert mappings, plus parameter-adding surgery branches.
 
         The correction mappings are always registered. Conversion tasks are built
         by walking Megatron's parameters, so for a model without the branch these
@@ -106,14 +106,33 @@ class MellumBridge(MegatronModelBridge):
         base = Qwen3MoEBridge.mapping_registry(self)
         return MegatronMappingRegistry(
             *base.mappings,
-            GatedMLPMapping(
+            AutoMapping(
                 megatron_param="decoder.layers.*.compensatory_mlp.linear_fc1.weight",
-                gate="model.layers.*.compensatory_mlp.gate_proj.weight",
-                up="model.layers.*.compensatory_mlp.up_proj.weight",
+                hf_param="model.layers.*.compensatory_mlp.up_proj.weight",
             ),
             AutoMapping(
                 megatron_param="decoder.layers.*.compensatory_mlp.linear_fc2.weight",
                 hf_param="model.layers.*.compensatory_mlp.down_proj.weight",
+            ),
+            AutoMapping(
+                megatron_param="decoder.layers.*.compensatory_mlp.norm.weight",
+                hf_param="model.layers.*.compensatory_mlp.norm.weight",
+            ),
+            AutoMapping(
+                megatron_param="decoder.layers.*.cross_gate.alpha",
+                hf_param="model.layers.*.cross_gate.alpha",
+            ),
+            AutoMapping(
+                megatron_param="decoder.layers.*.cross_gate.v_proj.weight",
+                hf_param="model.layers.*.cross_gate.v_proj.weight",
+            ),
+            AutoMapping(
+                megatron_param="decoder.layers.*.cross_gate.u_proj.weight",
+                hf_param="model.layers.*.cross_gate.u_proj.weight",
+            ),
+            AutoMapping(
+                megatron_param="decoder.layers.*.cross_gate.w_proj.weight",
+                hf_param="model.layers.*.cross_gate.w_proj.weight",
             ),
         )
 
@@ -127,7 +146,6 @@ class MellumBridge(MegatronModelBridge):
             # Without these an exported checkpoint would load into the original
             # sequential graph and silently produce wrong evaluation numbers.
             result["megatron_bridge_surgery_variant"] = variant
-            result["compensatory_mlp_expansion_factor"] = getattr(provider, "surgery_correction_expansion_factor", 1)
         result.update(
             max_position_embeddings=max(
                 provider.seq_length, math.ceil(factor * provider.yarn_original_max_position_embeddings)

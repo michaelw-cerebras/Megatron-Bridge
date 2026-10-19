@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from megatron.bridge.models.surgery import MANIFEST_NAME, manifest_variant, read_manifest
+from megatron.bridge.models.surgery import MANIFEST_NAME, get_variant, manifest_variant, read_manifest
 
 
 REPO = Path(__file__).resolve().parents[4]
@@ -22,7 +22,14 @@ pytestmark = pytest.mark.unit
 def _hf_checkpoint(root: Path, *, model_type: str = "mellum", architecture: str = "MellumForCausalLM") -> Path:
     root.mkdir(parents=True)
     (root / "config.json").write_text(
-        json.dumps({"architectures": [architecture], "model_type": model_type, "hidden_size": 8})
+        json.dumps(
+            {
+                "architectures": [architecture],
+                "model_type": model_type,
+                "hidden_size": 8,
+                "num_hidden_layers": 2,
+            }
+        )
     )
     (root / "model-00001-of-00002.safetensors").write_bytes(b"first-shard")
     (root / "model-00002-of-00002.safetensors").write_bytes(b"second-shard")
@@ -158,6 +165,36 @@ def test_schema_v1_manifests_still_resolve_to_a_variant(tmp_path):
     variant_id, params = manifest_variant(read_manifest(derived))
     assert variant_id == "v1"
     assert params["layers"] == {"kind": "all"}
+
+
+@pytest.mark.parametrize(("historical", "canonical"), [("v4", "v1_1"), ("v5_1", "v3_2"), ("v5_2", "v3_3")])
+def test_historical_schema_v2_ids_resolve_to_canonical_variants(tmp_path, historical, canonical):
+    derived = _hf_checkpoint(tmp_path / historical)
+    (derived / MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "artifact_format": "huggingface_safetensors",
+                "variant": {"id": historical, "slug": "historical", "params": {"layers": {"kind": "all"}}},
+            }
+        )
+    )
+
+    variant_id, _ = manifest_variant(read_manifest(derived))
+    assert variant_id == canonical
+    assert get_variant(historical).id == canonical
+
+
+@pytest.mark.parametrize(("historical", "canonical"), [("v4", "v1_1"), ("v5_1", "v3_2"), ("v5_2", "v3_3")])
+def test_new_clones_write_canonical_ids_for_historical_aliases(tmp_path, historical, canonical):
+    source = _hf_checkpoint(tmp_path / "source")
+    target = tmp_path / "target"
+    manifest = surgeon.clone_hf_checkpoint(source, target, variant_id=historical)
+
+    assert manifest["variant"]["id"] == canonical
+    target_config = json.loads((target / "config.json").read_text())
+    assert target_config["megatron_bridge_surgery_variant"] == canonical
+    assert target_config["megatron_bridge_architecture"] == f"surgery_{canonical}"
 
 
 def test_unreadable_manifest_schema_is_rejected(tmp_path):
@@ -399,6 +436,31 @@ def test_training_accepts_the_legacy_architecture_name(tmp_path):
     }
     train._apply_architecture(cfg, settings)
     assert cfg.model.transformer_layer_spec is not None
+
+
+@pytest.mark.parametrize(("historical", "canonical"), [("v4", "v1_1"), ("v5_1", "v3_2"), ("v5_2", "v3_3")])
+def test_training_accepts_historical_manifest_and_config_markers(tmp_path, historical, canonical):
+    source = _hf_checkpoint(tmp_path / "source")
+    target = tmp_path / "target"
+    surgeon.clone_hf_checkpoint(source, target, variant_id=canonical)
+
+    manifest = json.loads((target / MANIFEST_NAME).read_text())
+    manifest["variant"]["id"] = historical
+    manifest["target_architecture"] = f"surgery_{historical}"
+    (target / MANIFEST_NAME).write_text(json.dumps(manifest))
+    target_config = json.loads((target / "config.json").read_text())
+    target_config["megatron_bridge_surgery_variant"] = historical
+    target_config["megatron_bridge_architecture"] = f"surgery_{historical}"
+    (target / "config.json").write_text(json.dumps(target_config))
+
+    train = _load_mellum_train()
+    cfg = SimpleNamespace(model=_mellum_provider())
+    settings = {
+        "model": {"architecture": canonical, "hf_path": str(target)},
+        "run": {"resume_checkpoint": None},
+    }
+    train._apply_architecture(cfg, settings)
+    assert cfg.model.surgery_variant_id == canonical
 
 
 def test_training_rejects_a_config_that_disagrees_with_the_checkpoint(tmp_path):

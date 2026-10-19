@@ -1,4 +1,4 @@
-"""v4 — parallel attention/MLP plus a trainable compensatory MLP."""
+"""v1_1 — parallel attention/MLP plus a trainable compensatory MLP."""
 
 from types import SimpleNamespace
 
@@ -47,15 +47,16 @@ class _Correction(torch.nn.Module):
 
     def __init__(self, hidden: int = HIDDEN) -> None:
         super().__init__()
+        self.norm = torch.nn.RMSNorm(hidden)
         self.linear_fc1 = torch.nn.Linear(hidden, hidden, bias=False)
         self.linear_fc2 = torch.nn.Linear(hidden, hidden, bias=False)
 
     def forward(self, value: torch.Tensor) -> tuple[torch.Tensor, None]:
-        return self.linear_fc2(torch.nn.functional.silu(self.linear_fc1(value))), None
+        return self.linear_fc2(torch.nn.functional.silu(self.linear_fc1(self.norm(value)))), None
 
 
 def _layer(config: SimpleNamespace, *, correction: torch.nn.Module | None = None) -> CompensatedParallelLayer:
-    """Build a v4 layer with stub sublayers, bypassing Megatron's constructor."""
+    """Build a v1_1 layer with stub sublayers, bypassing Megatron's constructor."""
 
     class _Scale(torch.nn.Module):
         def __init__(self, factor: float) -> None:
@@ -80,28 +81,21 @@ def _layer(config: SimpleNamespace, *, correction: torch.nn.Module | None = None
 # --- registry -------------------------------------------------------------
 
 
-def test_v4_is_registered_and_declares_added_parameters():
-    variant = get_variant("v4")
+def test_v1_1_is_registered_and_declares_added_parameters():
+    variant = get_variant("v1_1")
     assert variant.slug == "compensated"
     assert variant.layer_module is CompensatedParallelLayer
     assert variant.adds_parameters is True
     assert variant.needs_wiring is True
-    assert variant.default_params["expansion_factor"] == 1
-    assert variant.default_params["init"] == "zero_output"
-    # v4 is layer-local, so unlike v2/v3/v3_1 it must NOT forbid pipeline parallelism.
+    assert variant.default_params["init"] == "random"
+    # v1_1 is layer-local, so unlike v2/v3/v3_1 it must NOT forbid pipeline parallelism.
     assert "no_pipeline_parallel" not in variant.config_requirements
-
-
-@pytest.mark.parametrize("value", [0, -1, 1.5, True])
-def test_expansion_factor_must_be_a_positive_integer(value):
-    with pytest.raises(ValueError, match="expansion_factor"):
-        get_variant("v4").resolve_params({"expansion_factor": value})
 
 
 def test_init_scheme_is_validated():
     with pytest.raises(ValueError, match="init must be one of"):
-        get_variant("v4").resolve_params({"init": "xavier"})
-    assert get_variant("v4").resolve_params({"init": "zero_output"})["init"] == "zero_output"
+        get_variant("v1_1").resolve_params({"init": "xavier"})
+    assert get_variant("v1_1").resolve_params({"init": "random"})["init"] == "random"
 
 
 # --- forward --------------------------------------------------------------
@@ -118,7 +112,7 @@ def test_forward_adds_the_correction_branch_to_the_parallel_sum():
     assert context is None
 
 
-def test_zero_output_init_makes_v4_start_exactly_at_v1():
+def test_zeroing_the_output_projection_makes_v1_1_equal_v1():
     # The branch contributes nothing at step 0, so the run begins from the
     # plain parallel model instead of a perturbed one.
     correction = _Correction()
@@ -162,16 +156,8 @@ def test_random_init_is_reproducible_and_layer_dependent():
     assert not torch.allclose(first.linear_fc1.weight, other_layer.linear_fc1.weight)
 
 
-def test_zero_output_init_zeros_only_the_output_projection():
-    correction = _Correction()
-    initialize_compensatory_mlp(correction, _config(), scheme="zero_output", seed=1, layer_number=1)
-    assert torch.count_nonzero(correction.linear_fc2.weight) == 0
-    # fc1 must stay random, or the branch could never escape the zero gradient.
-    assert torch.count_nonzero(correction.linear_fc1.weight) > 0
-
-
 def test_unknown_init_scheme_is_rejected():
-    with pytest.raises(ValueError, match="Unknown v4 correction init scheme"):
+    with pytest.raises(ValueError, match="Unknown v1_1 correction init scheme"):
         initialize_compensatory_mlp(_Correction(), _config(), scheme="orthogonal", seed=1, layer_number=1)
 
 
@@ -182,6 +168,7 @@ def test_initialization_leaves_no_uninitialized_parameter():
         parameter.data.fill_(float("nan"))
     initialize_compensatory_mlp(correction, _config(), scheme="random", seed=3, layer_number=2)
     assert all(torch.isfinite(parameter).all() for parameter in correction.parameters())
+    torch.testing.assert_close(correction.norm.weight, torch.ones_like(correction.norm.weight))
 
 
 # --- freezing -------------------------------------------------------------
@@ -219,10 +206,10 @@ def test_gradients_reach_only_the_correction_branch():
 def test_manifest_records_added_parameters():
     added = [{"name": "decoder.layers.*.compensatory_mlp.linear_fc1.weight", "shape": [HIDDEN, HIDDEN]}]
     manifest = build_manifest(
-        variant_id="v4",
+        variant_id="v1_1",
         variant_slug="compensated",
         equation="y = x + a + m + c",
-        params={"expansion_factor": 1},
+        params={"init": "random"},
         source_hf_directory="/src",
         model_type="mellum",
         parameter_tensors=2,

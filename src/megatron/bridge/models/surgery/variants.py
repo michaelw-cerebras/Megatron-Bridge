@@ -32,6 +32,8 @@ from megatron.core.transformer import ModuleSpec
 
 from megatron.bridge.models.surgery.adjacent_layer import AdjacentDecoderParallelLayer
 from megatron.bridge.models.surgery.compensated_layer import CompensatedParallelLayer
+from megatron.bridge.models.surgery.cross_injection_layer import CrossInjectedParallelLayer
+from megatron.bridge.models.surgery.manifest import canonical_variant_id
 from megatron.bridge.models.surgery.merged_pool_layer import MergedPoolDecoderLayer
 from megatron.bridge.models.surgery.parallel_layer import ParallelAttentionMLPLayer
 from megatron.bridge.models.surgery.requirements import check_config_requirements
@@ -69,7 +71,8 @@ class Variant:
             or ``None`` for the identity variant.
         config_requirements: Names of preconditions in ``CONFIG_REQUIREMENTS``.
         default_params: Parameter defaults merged under caller-supplied params.
-        selection_rule: ``"any"``, ``"contiguous"``, or ``"contiguous_groups"``.
+        selection_rule: ``"any"``, ``"contiguous"``, ``"contiguous_pairs"``, or
+            ``"contiguous_groups"``.
         needs_wiring: Whether the model needs a post-build step (cross-layer
             references, or initializing and freezing added parameters).
         adds_parameters: Whether the variant introduces weights that do not
@@ -111,15 +114,29 @@ class Variant:
             merged[key] = value
         if "layers" in merged:
             merged["layers"] = normalize_selector(merged["layers"])
-        if "expansion_factor" in merged:
-            factor = merged["expansion_factor"]
-            if not isinstance(factor, int) or isinstance(factor, bool) or factor < 1:
-                raise ValueError(f"Variant {self.id} requires an integer expansion_factor >= 1, got {factor!r}")
         if "init" in merged:
             from megatron.bridge.models.surgery.compensatory_mlp import INIT_SCHEMES
 
             if merged["init"] not in INIT_SCHEMES:
                 raise ValueError(f"Variant {self.id} init must be one of {list(INIT_SCHEMES)}, got {merged['init']!r}")
+        if "gate" in merged:
+            from megatron.bridge.models.surgery.cross_gate import GATE_KINDS
+
+            if merged["gate"] not in GATE_KINDS:
+                raise ValueError(f"Variant {self.id} gate must be one of {list(GATE_KINDS)}, got {merged['gate']!r}")
+        if "direction" in merged:
+            from megatron.bridge.models.surgery.cross_gate import DIRECTIONS
+
+            if merged["direction"] not in DIRECTIONS:
+                raise ValueError(
+                    f"Variant {self.id} direction must be one of {list(DIRECTIONS)}, got {merged['direction']!r}"
+                )
+        if "gate_dim_ratio" in merged:
+            ratio = merged["gate_dim_ratio"]
+            if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) or ratio <= 0:
+                raise ValueError(f"Variant {self.id} needs a positive gate_dim_ratio, got {ratio!r}")
+        if "freeze_original" in merged and not isinstance(merged["freeze_original"], bool):
+            raise ValueError(f"Variant {self.id} freeze_original must be a boolean")
         if "group_size" in merged:
             group_size = merged["group_size"]
             if not isinstance(group_size, int) or isinstance(group_size, bool) or group_size < 1:
@@ -143,6 +160,14 @@ class Variant:
             raise ValueError(
                 f"Variant {self.id} needs a contiguous run of layers because it couples neighbours; got {ordered}"
             )
+        if self.selection_rule == "contiguous_pairs":
+            # The formulation is pairwise: g(x, h_other) has one unambiguous
+            # "other" only with exactly two branches.
+            if len(ordered) % 2 != 0:
+                raise ValueError(
+                    f"Variant {self.id} pairs adjacent decoders, so the selected run length "
+                    f"({len(ordered)}) must be even"
+                )
         if self.selection_rule == "contiguous_groups":
             group_size = int(params["group_size"])
             if len(ordered) % group_size != 0:
@@ -193,6 +218,23 @@ VARIANTS: dict[str, Variant] = {
         config_requirements=_LAYER_LOCAL_REQUIREMENTS,
         default_params={"layers": _DEFAULT_LAYERS},
     ),
+    "v1_1": Variant(
+        id="v1_1",
+        slug="compensated",
+        summary="Parallel attention/MLP plus Ivan's normalized compensatory MLP; originals frozen.",
+        equation="y = x + a(N_a(x)) + m(N_m(x)) + W_d SiLU(W_u N_c(x))",
+        layer_module=CompensatedParallelLayer,
+        config_requirements=_LAYER_LOCAL_REQUIREMENTS,
+        default_params={
+            "layers": _DEFAULT_LAYERS,
+            "init": "random",
+            "init_seed": 1234,
+        },
+        # The hook initializes the new branch and freezes everything else; it is
+        # not cross-layer wiring, but it is still a required post-build step.
+        needs_wiring=True,
+        adds_parameters=True,
+    ),
     "v2": Variant(
         id="v2",
         slug="shifted",
@@ -226,21 +268,40 @@ VARIANTS: dict[str, Variant] = {
         selection_rule="contiguous_groups",
         needs_wiring=True,
     ),
-    "v4": Variant(
-        id="v4",
-        slug="compensated",
-        summary="Parallel attention/MLP plus a small trainable correction branch; originals frozen.",
-        equation="y = x + a(N_a(x)) + m(N_m(x)) + c_theta(x)",
-        layer_module=CompensatedParallelLayer,
-        config_requirements=_LAYER_LOCAL_REQUIREMENTS,
+    "v3_2": Variant(
+        id="v3_2",
+        slug="cross-scalar",
+        summary="Parallel decoders; each MLP sees a learnable scalar share of the other's attention.",
+        equation="o = h1 + m1(N(h1 + a1*A2)) + h2 + m2(N(h2 + a2*A1)) - x",
+        layer_module=CrossInjectedParallelLayer,
+        config_requirements=_CROSS_LAYER_REQUIREMENTS,
         default_params={
             "layers": _DEFAULT_LAYERS,
-            "expansion_factor": 1,
-            "init": "zero_output",
+            "gate": "scalar",
+            "direction": "both",
             "init_seed": 1234,
+            "freeze_original": False,
         },
-        # The hook initializes the new branch and freezes everything else; it is
-        # not cross-layer wiring, but it is still a required post-build step.
+        selection_rule="contiguous_pairs",
+        needs_wiring=True,
+        adds_parameters=True,
+    ),
+    "v3_3": Variant(
+        id="v3_3",
+        slug="cross-nonlinear",
+        summary="Parallel decoders; cross-injection gated by W[V(h-x) * SiLU(Ux)].",
+        equation="o = h1 + m1(N(h1 + g1(x,A2))) + h2 + m2(N(h2 + g2(x,A1))) - x",
+        layer_module=CrossInjectedParallelLayer,
+        config_requirements=_CROSS_LAYER_REQUIREMENTS,
+        default_params={
+            "layers": _DEFAULT_LAYERS,
+            "gate": "nonlinear",
+            "gate_dim_ratio": 0.25,
+            "direction": "both",
+            "init_seed": 1234,
+            "freeze_original": False,
+        },
+        selection_rule="contiguous_pairs",
         needs_wiring=True,
         adds_parameters=True,
     ),
@@ -259,8 +320,9 @@ def get_variant(variant_id: str) -> Variant:
     Raises:
         ValueError: If the identifier is unknown or the variant is retired.
     """
+    canonical = canonical_variant_id(variant_id)
     try:
-        variant = VARIANTS[variant_id]
+        variant = VARIANTS[canonical]
     except KeyError:
         raise ValueError(f"Unknown surgery variant {variant_id!r}; known: {sorted(VARIANTS)}") from None
     if variant.status != "active":

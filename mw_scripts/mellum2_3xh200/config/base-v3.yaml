@@ -137,5 +137,5 @@ run:
   resume_checkpoint: /workspace/ml-olympus/codesign_pretrain/runs/mellum2_base-v3_10B/checkpoints
 
   # Optional absolute optimizer-step limit for a short smoke; LR horizon stays unchanged.
-  exit_interval: null
+  exit_interval: 2100
 

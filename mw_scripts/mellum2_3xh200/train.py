@@ -109,13 +109,14 @@ def _apply_architecture(cfg: "ConfigContainer", settings: TrainingSettings) -> N
     from megatron.bridge.models.surgery import (
         ARCHITECTURE_FIELD,
         apply_surgery,
-        legacy_architecture,
         manifest_variant,
         read_manifest,
+        resolve_variant_reference,
     )
 
     architecture = settings["model"]["architecture"]
-    if architecture in {"original", "v0"}:
+    requested_variant = resolve_variant_reference(architecture)
+    if requested_variant == "v0":
         return
     hf_path = Path(settings["model"]["hf_path"])
     if not hf_path.is_dir():
@@ -123,10 +124,11 @@ def _apply_architecture(cfg: "ConfigContainer", settings: TrainingSettings) -> N
 
     manifest = read_manifest(hf_path)
     variant_id, params = manifest_variant(manifest)
-    if architecture not in {variant_id, legacy_architecture(variant_id)}:
+    if requested_variant != variant_id:
         raise ValueError(f"model.architecture is {architecture!r} but {hf_path} was produced for variant {variant_id}")
     hf_config = json.loads((hf_path / "config.json").read_text())
-    if hf_config.get(ARCHITECTURE_FIELD) != legacy_architecture(variant_id):
+    marker = hf_config.get("megatron_bridge_surgery_variant", hf_config.get(ARCHITECTURE_FIELD))
+    if not isinstance(marker, str) or resolve_variant_reference(marker) != variant_id:
         raise ValueError(f"Derived Hugging Face config is missing the {variant_id} surgery marker")
     if settings["run"]["resume_checkpoint"] is None and cfg.model.perform_initialization:
         raise ValueError("Initial surgery HF import must disable Megatron random initialization")
@@ -169,6 +171,10 @@ def build_config(settings: TrainingSettings, mixture: MixtureSnapshot, *, world_
         cfg.model.moe_token_dispatcher_type = performance["moe_token_dispatcher_type"]
         cfg.model.moe_flex_dispatcher_backend = None
         cfg.model.moe_permute_fusion = performance["moe_permute_fusion"]
+        if "recompute_method" in performance:
+            cfg.model.recompute_granularity = "full"
+            cfg.model.recompute_method = performance["recompute_method"]
+            cfg.model.recompute_num_layers = performance["recompute_num_layers"]
     # Apply surgery only after all graph requirements (notably PP and dispatcher
     # overlap) have their final YAML values.
     _apply_architecture(cfg, settings)
@@ -294,7 +300,9 @@ def main() -> None:
                     settings["run"].get("override_checkpoint_scheduler", False)
                     and is_scheduler_recovery(mixture["config"], settings)
                 ):
-                    raise ValueError("Run already has a different immutable mixture/config; choose a new run.directory")
+                    raise ValueError(
+                        "Run already has a different immutable mixture/config; choose a new run.directory"
+                    )
                 LOGGER.warning("Refreshing the frozen snapshot for an explicit LR/scheduler recovery")
                 mixture["config"] = settings
                 mixture["config_digest"] = config_digest(settings)

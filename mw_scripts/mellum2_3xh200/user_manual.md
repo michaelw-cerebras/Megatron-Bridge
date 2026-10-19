@@ -1,12 +1,16 @@
 # Mellum2 Architecture Variants: H200 Continued Pretraining
 
-This pipeline runs continued pretraining for the Base and Thinking Mellum2
-checkpoints and the five architecture-surgery variants of each. v0-v3_1 train
-all parameters; v4 freezes the source model and trains only its new correction
-branches. The default
+This pipeline contains eight Base cases and six Thinking cases. The Base-only
+v3_2 and v3_3 cases are the scalar and nonlinear cross-injection experiments.
+All cases except v1_1 train the original parameters; v1_1 freezes the source
+model and trains only its new correction branches. The default
 target is GPU node 32 (one 8xH200 node); `MELLUM_NODES` still controls topology.
 
-Select one of the twelve cases with `--variant`:
+Select one of the fourteen cases with `--variant`:
+
+Human-facing labels use dots (v1.1, v3.1, v3.2, v3.3), while YAML filenames,
+registry ids, checkpoint metadata, and run directories use underscores. The
+launcher accepts either spelling and canonicalizes it to the underscore form.
 
 | Case | Graph | Initial HF checkpoint |
 |---|---|---|
@@ -15,23 +19,25 @@ Select one of the twelve cases with `--variant`:
 | `base-v2` | shifted adjacent-layer schedule | local byte-identical v2 derivative |
 | `base-v3` | adjacent decoders in parallel | local byte-identical v3 derivative |
 | `base-v3_1` | parallel decoders with a merged expert pool | local byte-identical v3_1 derivative |
-| `base-v4` | parallel attention/MoE plus trainable correction | local v4 derivative with zero-output correction metadata |
+| `base-v1_1` | parallel attention/MoE plus Ivan-style trainable correction | local v1_1 derivative with deterministic random correction metadata |
+| `base-v3_2` | adjacent parallel decoders with scalar cross-attention injection | local v3_2 derivative; zero-initialized scalar gates |
+| `base-v3_3` | adjacent parallel decoders with nonlinear cross-attention injection | local v3_3 derivative; zero-output nonlinear gates |
 | `thinking-v0` | original sequential baseline | JetBrains Thinking |
 | `thinking-v1` | parallel attention/MoE | local byte-identical v1 derivative |
 | `thinking-v2` | shifted adjacent-layer schedule | local byte-identical v2 derivative |
 | `thinking-v3` | adjacent decoders in parallel | local byte-identical v3 derivative |
 | `thinking-v3_1` | parallel decoders with a merged expert pool | local byte-identical v3_1 derivative |
-| `thinking-v4` | parallel attention/MoE plus trainable correction | local v4 derivative with zero-output correction metadata |
+| `thinking-v1_1` | parallel attention/MoE plus Ivan-style trainable correction | local v1_1 derivative with deterministic random correction metadata |
 
-The ten derived checkpoints live under
+The derived checkpoints live under
 `/cb/ml-olympus/codesign_pretrain/checkpoints`. Every inherited tensor remains
 byte-identical to its source; `architecture_surgery.json` selects the graph and,
-for v4, specifies the deterministic correction-branch initialization. See
+for v1_1, specifies the deterministic correction-branch initialization. See
 `mw_scripts/model_surgeon/README.md` for the exact equations and invariants.
 
 ## Files and Configuration Entry Points
 
-- `config/*.yaml`: the twelve complete case configs. v3_1 inherits v3's measured
+- `config/*.yaml`: the fourteen complete case configs. v3_1, v3_2 and v3_3 inherit v3's measured
   starting point until its own throughput sweep is complete.
 - `config.yaml`: retained as a legacy editable example; the launcher does not select it by default.
 - `configuration.py`: YAML validation, tokenizer ID checks, and shard weight resolution.
@@ -49,23 +55,40 @@ Model support is limited to the all-MoE Mellum2 architecture with SiLU,
 normalized top-k routing, and identical local/global RoPE bases.
 Unsupported variants raise errors. Parallel attention/MoE cannot be enabled by changing YAML alone.
 
-The ten case configs use the same 100%-normalized mixture and 10B-token budget so
+The fourteen case configs use the same 100%-normalized mixture and 10B-token budget so
 convergence comparisons differ only by source checkpoint and graph.
 They save every 100 optimizer steps and set `run.keep_last_checkpoints: 3`.
 Bridge deletes older
 `iter_*` directories only after a newer checkpoint saves successfully, and it
 also saves the final checkpoint after normal completion.
-The full-parameter cases use peak/min LR `3e-5`/`3e-6`. v4 uses
-`3e-6`/`3e-7`: higher values through `3e-4` produced non-finite loss in
-accelerated peak-LR smokes. These are experimental continued-pretraining
-settings, not the model's official training hyperparameters.
+All cases use peak/min LR `3e-5`/`3e-6`. Current v1_1 matches Ivan's normalized,
+non-gated compensatory branch and freezes every source parameter; the older
+gated/zero-output v1_1 and its low-LR recovery results are retired.
 All one-node cases use BF16, TP=1, PP=1, CP=1, and ETP=1. The measured baseline
 uses EP=8; surgery variants use EP=4 with all-to-all dispatch and permute fusion.
-v0-v3_1 use MBS1. v4 uses MBS2 (12 gradient-accumulation steps), enabled by
-freezing the source weights; it measured 140.8k tokens/s on one 8xH200 node.
-v2/v3/v3_1 require PP=1 and do not support expert-parallel overlap. Before a long
+v0, v1, v2, v3, v3_1, v3_2, and v3_3 use MBS1 and GBS192
+(24 gradient-accumulation steps). The current v1_1
+trains only its 297M correction parameters and uses MBS2 with the same GBS192
+(12 accumulation steps); keeping GBS fixed preserves the optimizer batch size.
+v2/v3/v3_1/v3_2/v3_3 require PP=1 and do not support expert-parallel overlap. Before a long
 v3_1 run, use a short real-EP smoke test and confirm both merged expert pools receive
 router gradients and `merged_pool_frac_0` is neither pinned nor collapsed.
+
+### Historical artifact names
+
+The completed 2100-step experiments retain their original storage and W&B
+provenance. Readers normalize these names automatically:
+
+| Historical artifact id | Canonical id |
+|---|---|
+| `v4` | `v1_1` |
+| `v5_1` | `v3_2` |
+| `v5_2` | `v3_3` |
+
+Do not rename the historical `runs/mellum2_base-v4_10B`, `-v5_1_10B`, or
+`-v5_2_10B` directories. New launches use canonical run names. The local
+Thinking-derived checkpoints were intentionally removed; their YAML files are
+templates until those checkpoints are generated again.
 
 ## Docker and File Paths
 

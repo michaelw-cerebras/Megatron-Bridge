@@ -167,9 +167,10 @@ def apply_surgery(
         # Recorded on the provider so HF export can describe the graph a
         # reloaded checkpoint must rebuild.
         provider.surgery_variant_id = resolved.id
-    if resolved.id == "v4" and selected:
-        # The layer reads this at construction time to size its correction branch.
-        provider.surgery_correction_expansion_factor = int(resolved_params["expansion_factor"])
+    if resolved.id in {"v3_2", "v3_3"} and selected:
+        # The layer reads these at construction time to build its gate.
+        provider.surgery_gate_kind = str(resolved_params["gate"])
+        provider.surgery_gate_dim_ratio = float(resolved_params.get("gate_dim_ratio", 0.25))
     if resolved.id == "v3_1" and selected:
         provider.moe_additional_logging_metrics = tuple(
             f"merged_pool_frac_{index}" for index in range(int(resolved_params["group_size"]))

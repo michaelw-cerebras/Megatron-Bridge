@@ -46,6 +46,19 @@ from megatron.bridge.models.surgery.compensatory_mlp import (
     freeze_except_compensatory,
     initialize_compensatory_mlp,
 )
+from megatron.bridge.models.surgery.cross_gate import (
+    GATE_ATTRIBUTE,
+    gate_is_active,
+    initialize_cross_gate,
+)
+from megatron.bridge.models.surgery.cross_injection_layer import (
+    BRANCHES,
+    CrossInjectedParallelLayer,
+    CrossInjectionPlan,
+)
+from megatron.bridge.models.surgery.cross_injection_layer import (
+    PLAN_ATTRIBUTE as CROSS_PLAN_ATTRIBUTE,
+)
 from megatron.bridge.models.surgery.merged_moe import check_merged_pool_support
 from megatron.bridge.models.surgery.merged_pool_layer import (
     PLAN_ATTRIBUTE as MERGED_POOL_PLAN_ATTRIBUTE,
@@ -123,7 +136,7 @@ def _prepare_compensatory(
     selected: frozenset[int],
     params: Mapping[str, Any],
 ) -> None:
-    """Initialize v4's correction branches and freeze every original weight.
+    """Initialize v1_1's correction branches and freeze every original weight.
 
     Megatron is told to skip initialization so the Hugging Face import owns all
     original weights; nothing would otherwise write to the new branch. Layers
@@ -137,7 +150,7 @@ def _prepare_compensatory(
             continue
         # layer_number is 1-based and global; the selector is 0-based.
         if (layer.layer_number - 1) not in selected:
-            raise ValueError(f"Layer {layer.layer_number} has a correction branch but was not selected for v4")
+            raise ValueError(f"Layer {layer.layer_number} has a correction branch but was not selected for v1_1")
         initialize_compensatory_mlp(
             correction,
             layer.config,
@@ -149,7 +162,7 @@ def _prepare_compensatory(
 
     trainable, frozen = freeze_except_compensatory(model)
     LOGGER.info(
-        "Variant v4: initialized %d correction branches (%s, seed %s); %d trainable / %d frozen parameters",
+        "Variant v1_1: initialized %d correction branches (%s, seed %s); %d trainable / %d frozen parameters",
         len(prepared),
         params["init"],
         params["init_seed"],
@@ -157,7 +170,59 @@ def _prepare_compensatory(
         frozen,
     )
     if trainable == 0:
-        raise ValueError("Variant v4 froze every parameter; the correction branches were not found")
+        raise ValueError("Variant v1_1 froze every parameter; the correction branches were not found")
+
+
+def _wire_cross_injection(
+    model: torch.nn.Module,
+    layers: Sequence[torch.nn.Module],
+    selected: Sequence[int],
+    params: Mapping[str, Any],
+) -> None:
+    """Pair adjacent decoders, initialize their gates, and optionally freeze."""
+    direction = str(params["direction"])
+    for start in range(0, len(selected), BRANCHES):
+        pair = selected[start : start + BRANCHES]
+        members = tuple(sublayers_of(layers[index]) for index in pair)
+        gates: list[torch.nn.Module | None] = []
+        for position, index in enumerate(pair):
+            layer = layers[index]
+            if not isinstance(layer, CrossInjectedParallelLayer):
+                raise ValueError(f"Layer {index} is {type(layer).__name__}, expected a v3_2/v3_3 layer")
+            gate = getattr(layer, GATE_ATTRIBUTE)
+            initialize_cross_gate(
+                gate,
+                layer.config,
+                seed=int(params["init_seed"]),
+                layer_number=layer.layer_number,
+            )
+            gates.append(gate if gate_is_active(direction, position=position, group_size=len(pair)) else None)
+
+        for position, index in enumerate(pair):
+            layers[index].__dict__[CROSS_PLAN_ATTRIBUTE] = CrossInjectionPlan(
+                group=members if position == len(pair) - 1 else None,
+                gates=tuple(gates),
+            )
+
+    if params.get("freeze_original", False):
+        trainable = 0
+        frozen = 0
+        for name, parameter in model.named_parameters():
+            if GATE_ATTRIBUTE in name.split("."):
+                parameter.requires_grad = True
+                trainable += parameter.numel()
+            else:
+                parameter.requires_grad = False
+                frozen += parameter.numel()
+        if trainable == 0:
+            raise ValueError("Variant v3_2/v3_3 froze every parameter; the cross gates were not found")
+        LOGGER.info("Variant v3_2/v3_3: %d trainable / %d frozen parameters", trainable, frozen)
+    LOGGER.info(
+        "Wired v3_2/v3_3 cross-injection across %d pairs (gate=%s, direction=%s)",
+        len(selected) // BRANCHES,
+        params.get("gate"),
+        direction,
+    )
 
 
 def wire_model(model: torch.nn.Module, *, variant: str, params: Mapping[str, Any] | None = None) -> None:
@@ -179,7 +244,7 @@ def wire_model(model: torch.nn.Module, *, variant: str, params: Mapping[str, Any
         return
 
     layers = _decoder_layers(model)
-    if resolved.id == "v4":
+    if resolved.id == "v1_1":
         # Layer-local: no cross-layer references, so pipeline stages are fine.
         _prepare_compensatory(model, layers, selected, resolved_params)
         return
@@ -194,6 +259,8 @@ def wire_model(model: torch.nn.Module, *, variant: str, params: Mapping[str, Any
     ordered = sorted(selected)
     if resolved.id == "v2":
         _wire_shifted(layers, ordered)
+    elif resolved.id in {"v3_2", "v3_3"}:
+        _wire_cross_injection(model, layers, ordered, resolved_params)
     elif resolved.id == "v3_1":
         _wire_merged_pool(layers, ordered, int(resolved_params["group_size"]))
     else:

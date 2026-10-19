@@ -28,6 +28,7 @@ from megatron.bridge.models.surgery.manifest import (
     legacy_architecture,
     manifest_variant,
     read_manifest,
+    resolve_variant_reference,
 )
 
 
@@ -358,7 +359,8 @@ def verify_checkpoint(source_dir: Path, target_dir: Path) -> VerificationResult:
     manifest = read_manifest(target_dir)
     variant_id, _ = manifest_variant(manifest)
     target_config = _read_json(target_dir / "config.json")
-    if target_config.get(ARCHITECTURE_FIELD) != legacy_architecture(variant_id):
+    marker = target_config.get("megatron_bridge_surgery_variant", target_config.get(ARCHITECTURE_FIELD))
+    if not isinstance(marker, str) or resolve_variant_reference(marker) != variant_id:
         raise ValueError("Target config surgery marker does not match its manifest variant")
 
     source_index = _read_json(source_dir / "model.safetensors.index.json")

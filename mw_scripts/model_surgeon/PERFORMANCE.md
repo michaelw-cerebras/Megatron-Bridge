@@ -4,10 +4,10 @@ This file records reproducible single-node H200 measurements for the derived
 Mellum2 parallel architecture. It is intentionally separate from the production
 training configuration.
 
-## Twelve-case matrix (2026-10-14)
+## Fourteen-case matrix (updated 2026-10-17)
 
-The production cases are `base-v0..v4` and `thinking-v0..v4`, including v3_1.
-Base and Thinking
+The production cases are `base-v0..v3_3` (including v3_1 and both cross-injection variants)
+and `thinking-v0..v1_1`. Base and Thinking
 have the same architecture, so performance tuning is performed once per graph
 and the result is shared by both source checkpoints.
 
@@ -18,7 +18,9 @@ and the result is shared by both source checkpoints.
 | v2 shifted | BF16, TP1/PP1/CP1/EP4/ETP1, all-to-all, permute fusion | Measured below |
 | v3 adjacent | BF16, TP1/PP1/CP1/EP4/ETP1, all-to-all, permute fusion | Measured below |
 | v3_1 merged pool | BF16, TP1/PP1/CP1/EP4/ETP1, all-to-all, permute fusion | Inherits v3 starting point |
-| v4 compensated | BF16, TP1/PP1/CP1/EP4/ETP1, MBS2, all-to-all, permute fusion | Measured below |
+| v1_1 compensated | BF16, TP1/PP1/CP1/EP4/ETP1, MBS2, all-to-all, permute fusion | Measured below |
+| v3_2 cross-scalar | BF16, TP1/PP1/CP1/EP4/ETP1, MBS1, all-to-all, permute fusion | Real-GPU smoke below; inherits v3 starting point |
+| v3_3 cross-nonlinear | BF16, TP1/PP1/CP1/EP4/ETP1, MBS1, all-to-all, permute fusion | Real-GPU smoke below; inherits v3 starting point |
 
 The controlled v2/v3 sweep ran on GPU-31 after it became available. It compared
 EP8 without fusion, EP4 without fusion, and EP4 with fusion for each graph while
@@ -108,31 +110,52 @@ Megatron emitted an `AccumulateGrad` stream-mismatch performance warning for
 v2/v3 because their graphs carry activations across adjacent layers. It did not
 affect numerical validity, but it remains a possible future optimization area.
 
-## v4 results (2026-10-14 PDT)
+## v1_1 results (2026-10-17 PDT)
 
-The first full-model smoke exposed an initialization issue: random correction
-weights produced a non-finite forward loss at optimizer iteration 2. The
-production default is therefore `zero_output`, which makes step 0 exactly equal
-to v1 while retaining trainable input projections. Every accepted candidate
-below completed eight iterations with finite loss and gradients and no skipped
-or NaN iterations.
+v1_1 was replaced in place by Ivan's RMSNorm + non-gated hidden-width SiLU MLP;
+all measurements from the incompatible gated/zero-output prototype were
+removed. Current v1_1 uses the same `3e-5`/`3e-6` optimizer schedule and GBS192
+as the other Mellum arms while training only its 297,335,808 new parameters.
+Unlike the full-training variants, this leaves sufficient memory for MBS2,
+reducing gradient accumulation from 24 to 12 microbatches. Its 2100-step
+stability run completed successfully on one 8xH200 node.
 
-Peak learning rate was tested separately with a two-iteration warmup. `3e-4`,
-`1e-4`, and `3e-5` all produced a non-finite forward loss immediately after
-reaching peak. `3e-6` completed 12/12 iterations at peak with loss decreasing
-from 6.308 to 4.049, so production v4 uses peak/min LR `3e-6`/`3e-7`.
+The first controlled live comparison kept GBS192 and every other setting fixed.
+At iteration 10, MBS1 took 32.07 seconds (iteration 20: 30.26 seconds), whereas
+MBS2 took 13.07 seconds, or about 120,330 tokens/s. MBS2 used at most roughly
+93 GiB of the 144 GiB per GPU in the initial observation. Its iteration-10 loss
+and gradient norm (`6.697635`, `12.987`) closely matched MBS1 (`6.697527`,
+`12.946`), with zero skipped and zero NaN iterations in both runs. MBS2 is kept
+for the stability run; larger microbatches are not used unattended because the
+remaining memory is valuable headroom for MoE imbalance and allocator peaks.
 
-| Candidate | Steady ms/step | tokens/s | Result |
-|---|---:|---:|---|
-| TP1/EP4, MBS1 + permute fusion | 29,788 | 52,800 | Valid, under-batched |
-| TP1/EP4, MBS2 + permute fusion | **11,173** | **140,778** | **Best v4** |
-| TP2/EP4, MBS2 + permute fusion | 13,412 | 117,274 | Valid, slower |
-| TP1/EP4, MBS1, random init | n/a | n/a | Rejected: NaN at iteration 2 |
+Across all 210 logged ten-step windows in the completed MBS2 run, mean step
+time was 10.620 seconds, or 148,111 tokens/s for GBS192 at sequence length
+8192. The run reached step 2100 with loss `1.637017`, gradient norm `0.249`,
+zero skipped iterations, zero NaN iterations, zero fatal errors, and zero
+cgroup OOM events. The launcher exited with status zero and the final three
+retained checkpoints are steps 1900, 2000, and 2100. The step-2100 checkpoint
+contains 13 non-empty files totaling 28,482,765,826 bytes. Observed GPU memory
+remained around 93--94 GiB out of 144 GiB during steady training.
 
-Because the original 12B parameters are frozen, v4 avoids their optimizer-state
-memory and can safely use MBS2. This reduces gradient accumulation from 24 to 12
-and makes v4 23.5% faster than the measured v1 winner. MBS3 was not attempted:
-MBS2 already approached the practical H200 process-memory ceiling.
+## Cross-injection (v3_2/v3_3) bring-up (2026-10-17 PDT)
+
+Both variants were validated with two full optimizer steps on one 8xH200 node
+using BF16, TP1/PP1/CP1/EP4/ETP1, MBS1, GBS192, standard all-to-all, and
+permute fusion. The smoke used eight real shards sampled from the current
+9876-shard immutable mixture. The first iteration includes warmup and is not a
+throughput measurement.
+
+| Graph | Iteration 2 ms/step | loss | grad norm | Peak process memory / GPU | Result |
+|---|---:|---:|---:|---:|---|
+| v3_2 cross-scalar | 14,725 | 7.691956 | 26.239 | about 83.4 GiB | Valid; skipped 0, NaN 0 |
+| v3_3 cross-nonlinear | 15,287 | 7.691956 | 26.236 | about 85.0 GiB | Valid; skipped 0, NaN 0 |
+
+The identical initial losses are expected: v3_2 initializes each scalar to
+zero, while v3_3 initializes each output projection to zero, so both begin at
+the v3 graph. These two-step numbers establish correctness and memory
+feasibility only. v3_3 was about 3.8% slower in this short comparison; a longer
+throughput sweep should exclude warmup before changing the production config.
 
 ## Recommended single-node configuration
 
@@ -157,10 +180,11 @@ parallelism:
 ```
 
 Set `performance.moe_permute_fusion: true`. Keep BF16, standard all-to-all,
-activation recompute off, CUDA graphs off, and EP overlap off. The eight
-production YAML files for v0-v3 use MBS1. For v4, use MBS2 with zero-output
-initialization as encoded by its derived checkpoint; all twelve production YAML
-files encode the graph-specific choices.
+activation recompute off, CUDA graphs off, and EP overlap off. The production
+YAML files for v0-v3_1, v3_2 and v3_3 use MBS1. Current Ivan-style v1_1 uses MBS2 because only
+its correction branch is trainable; this recommendation does not refer to the
+retired zero-output v1_1 prototype. All fourteen production YAML files encode the
+graph-specific choices.
 These measurements apply to one 8-H200 NVLink node; re-profile EP and
 dispatcher settings when returning to multiple nodes.
 

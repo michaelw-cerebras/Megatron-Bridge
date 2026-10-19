@@ -85,8 +85,9 @@ def test_launcher_derives_topology_without_contacting_real_nodes(
 
 def test_all_variant_configs_are_complete_and_valid() -> None:
     config_dir = REPO / "mw_scripts/mellum2_3xh200/config"
-    variants = ("v0", "v1", "v2", "v3", "v3_1", "v4")
-    expected = {f"{family}-{variant}.yaml" for family in ("base", "thinking") for variant in variants}
+    shared_variants = ("v0", "v1", "v2", "v3", "v3_1", "v1_1")
+    expected = {f"{family}-{variant}.yaml" for family in ("base", "thinking") for variant in shared_variants}
+    expected.update({"base-v3_2.yaml", "base-v3_3.yaml"})
     assert {path.name for path in config_dir.glob("*.yaml")} == expected
     for path in config_dir.glob("*.yaml"):
         config = configuration.read_config(path)
@@ -99,17 +100,68 @@ def test_all_variant_configs_are_complete_and_valid() -> None:
         assert config["wandb"]["run_name"].endswith("_10B")
         assert config["run"]["directory"].endswith("_10B")
         assert sum(config["dataset"]["subsets"].values()) == pytest.approx(100.0)
-        expected_micro_batch_size = 2 if variant == "v4" else 1
-        expected_accumulation = 12 if variant == "v4" else 24
-        assert config["train"]["micro_batch_size"] == expected_micro_batch_size
+        # v1_1 trains only its correction branches, so it fits a larger micro batch.
+        # GBS stays 192 across every arm, so the optimizer batch size is identical
+        # and only the accumulation count changes.
+        expected_micro_batch = 2 if variant == "v1_1" else 1
+        expected_accumulation = 192 // (expected_micro_batch * 8)
+        assert config["train"]["micro_batch_size"] == expected_micro_batch
         assert configuration.validate_parallelism(config, world_size=8, experts=64) == expected_accumulation
-        # v4's zero-initialized dense residual branch requires a much lower LR
-        # than the full-finetune arms; a long run at 3e-6 became non-finite.
-        expected_lr = 0.00000003 if variant == "v4" else 0.00003
-        assert config["optimizer"]["lr"] == expected_lr
+        assert config["optimizer"]["lr"] == 0.00003
 
 
-@pytest.mark.parametrize("variant", ["base-v2", "base-v3_1", "thinking-v3_1", "base-v4", "thinking-v4"])
+def test_launcher_help_lists_only_canonical_variant_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MELLUM_ENV_FILE", "")
+    result = subprocess.run(
+        ["bash", str(REPO / "mw_scripts/mellum2_3xh200/launch.sh"), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "base-v{0,1,1.1,2,3,3.1,3.2,3.3}" in result.stdout
+    assert "thinking-v{0,1,1.1,2,3,3.1}" in result.stdout
+    assert "5_1" not in result.stdout
+    assert "5_2" not in result.stdout
+
+
+def test_launcher_accepts_dotted_variant_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MELLUM_ENV_FILE", "")
+    result = subprocess.run(
+        [
+            "bash",
+            str(REPO / "mw_scripts/mellum2_3xh200/launch.sh"),
+            "--variant",
+            "base-v3.3",
+            "--help",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "config/base-v3_3.yaml" in result.stdout
+
+
+def test_recompute_is_runtime_only_and_validated(tmp_path: Path) -> None:
+    source = configuration.read_config(REPO / "mw_scripts/mellum2_3xh200/config/base-v3_2.yaml")
+    tuned = copy.deepcopy(source)
+    tuned["performance"]["recompute_method"] = "block"
+    tuned["performance"]["recompute_num_layers"] = 2
+    assert configuration.config_digest(tuned) == configuration.config_digest(source)
+
+    target = REPO / "mw_scripts/mellum2_3xh200/config/base-v3_2.yaml"
+    text = target.read_text().replace(
+        "  moe_permute_fusion: true\n", "  moe_permute_fusion: true\n  recompute_method: block\n"
+    )
+    with pytest.raises(ValueError, match="must be set together"):
+        path = tmp_path / "invalid-mellum-recompute.yaml"
+        path.write_text(text)
+        configuration.read_config(path)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    ["base-v2", "base-v3_1", "thinking-v3_1", "base-v1_1", "thinking-v1_1", "base-v3_2", "base-v3_3"],
+)
 def test_launcher_selects_variant_config_without_contacting_nodes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
@@ -373,9 +425,7 @@ def test_scheduler_recovery_rejects_unrelated_config_changes():
     new_config["optimizer"]["lr"] /= 10
     new_config["optimizer"]["min_lr"] /= 10
     new_config["scheduler"]["lr_warmup_iters"] += 1
-    new_config["run"].update(
-        resume_checkpoint="/tmp/checkpoints", override_checkpoint_scheduler=True
-    )
+    new_config["run"].update(resume_checkpoint="/tmp/checkpoints", override_checkpoint_scheduler=True)
     assert configuration.is_scheduler_recovery(old_config, new_config)
     new_config["train"]["seed"] += 1
     assert not configuration.is_scheduler_recovery(old_config, new_config)

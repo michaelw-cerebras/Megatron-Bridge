@@ -23,18 +23,24 @@ Consequences worth knowing:
   configuration must be indistinguishable from the original. That is the
   regression test every new variant inherits for free.
 
-`v4` is the first variant to break this: it **adds** a trainable correction
-branch. The weakened invariant it keeps is still useful — every tensor
+`v1_1` was the first variant to break this, and `v3_2`/`v3_3` also add weights
+(gates rather than a correction branch). The weakened invariant they keep is
+still useful — every tensor
 inherited from the original is unchanged in key, shape and value, and the new
-ones are enumerated in the manifest's `adds_parameters`. Variants that *edit*
+ones are enumerated in the manifest's `adds_parameters`. Each such variant
+must describe its own tensors in `added_parameters.py`; one that declares
+`adds_parameters` without a description raises, because a manifest naming
+another variant's tensors is worse than no manifest at all. Variants that *edit*
 existing tensors (dropping layers, merging experts, width surgery) would be a
 third category and still do not exist.
 
 ## Variants
 
-Identifiers are **append-only**. A variant that turns out to be wrong is marked
-`retired`; its number is never reused and never renumbered, because manifests,
-run directories, and result keys reference it forever.
+Canonical machine identifiers use underscores (`v1_1`, `v3_2`, `v3_3`); prose
+may render them as v1.1, v3.2, and v3.3. The October 2026 naming cleanup kept
+read compatibility for the historical artifact ids `v4`, `v5_1`, and `v5_2`.
+New manifests never write those historical ids, while old run directories and
+result keys remain unchanged for provenance.
 
 | id | slug | scope | equation |
 |----|------|-------|----------|
@@ -43,11 +49,13 @@ run directories, and result keys reference it forever.
 | `v2` | shifted | across adjacent layers | `u_i = u_{i-1} + m_{i-1}(N^m_{i-1}(u_{i-1})) + a_i(N^a_i(u_{i-1}))` |
 | `v3` | adjacent | across whole decoders | `y = x + Σ_i δ_i(x)`, `δ_i(u) = a_i(u) + m_i(u + a_i(u))` |
 | `v3_1` | merged-pool | across whole decoders | `z = x + Σ_i a_i(x)`; `y = z + ` global top-(g·k) over `concat_i router_i(z)` |
-| `v4` | compensated | within a layer | `y = x + a(N_a(x)) + m(N_m(x)) + c_θ(x)` — **adds parameters** |
+| `v1_1` | compensated | within a layer | `y = x + a(N_a(x)) + m(N_m(x)) + c_θ(x)` — **adds parameters** |
+| `v3_2` | cross-scalar | across a decoder pair | v3 plus `m_i(N(h_i + α_i·a_other))` — **adds parameters** |
+| `v3_3` | cross-nonlinear | across a decoder pair | same with `g = W[V(h−x) * SiLU(Ux)]` — **adds parameters** |
 
 Per-variant notes live in `variants/`.
 
-`v2`, `v3` and `v3_1` execute one layer's sublayers inside a neighbour's forward, which
+`v2`, `v3`, `v3_1`, `v3_2` and `v3_3` execute one layer's sublayers inside a neighbour's forward, which
 is why they carry two extra preconditions: **`no_pipeline_parallel`** (PP=1
 only — across a stage boundary the coupled layers live on different ranks, and
 expressing the graph would require relocating weights) and
@@ -82,7 +90,7 @@ Mellum, `moe_layer_freq` or `layer_types` elsewhere.
 | `surgeon.py` | CLI: clone a checkpoint and record its variant |
 | `verify.py` | re-verify that a derived checkpoint's weights are byte-exact |
 | `benchmark.py` | single-node throughput comparison |
-| `check_v4_roundtrip.py` | GPU check: v4 Megatron → HF export → reload |
+| `check_v1_1_roundtrip.py` | GPU check: v1_1 Megatron → HF export → reload |
 | `variants/` | one note per variant: motivation, equation, measured results |
 | `results/` | loss curves and eval tables, keyed by variant and ratio |
 
@@ -97,14 +105,17 @@ importable by training and by checkpoint resume:
 | `src/megatron/bridge/models/surgery/requirements.py` | per-variant preconditions |
 | `src/megatron/bridge/models/surgery/manifest.py` | the manifest contract |
 | `src/megatron/bridge/models/surgery/sublayers.py` | shared attention/MLP invocation |
-| `src/megatron/bridge/models/surgery/wiring.py` | cross-layer references for v2/v3/v3_1 |
+| `src/megatron/bridge/models/surgery/wiring.py` | post-build wiring for v2/v3/v3_1/v1_1/v3_2/v3_3 |
 | `src/megatron/bridge/models/surgery/merged_moe.py` | joint routing over merged expert pools |
 | `src/megatron/bridge/models/surgery/parallel_layer.py` | v1's layer |
 | `src/megatron/bridge/models/surgery/shifted_layer.py` | v2's layer |
 | `src/megatron/bridge/models/surgery/adjacent_layer.py` | v3's layer |
 | `src/megatron/bridge/models/surgery/merged_pool_layer.py` | v3_1's layer |
-| `src/megatron/bridge/models/surgery/compensated_layer.py` | v4's layer |
-| `src/megatron/bridge/models/surgery/compensatory_mlp.py` | v4's correction branch, init and freeze |
+| `src/megatron/bridge/models/surgery/compensated_layer.py` | v1_1's layer |
+| `src/megatron/bridge/models/surgery/compensatory_mlp.py` | v1_1's correction branch, init and freeze |
+| `src/megatron/bridge/models/surgery/cross_injection_layer.py` | the cross-injection layer |
+| `src/megatron/bridge/models/surgery/cross_gate.py` | the scalar and nonlinear cross gates |
+| `src/megatron/bridge/models/surgery/added_parameters.py` | manifest description of added weights |
 
 ## Model-agnostic by construction
 
@@ -122,7 +133,7 @@ layout, per-layer RoPE. Surgery only decides which layers get the rewritten
 graph. Nothing under `surgery/` mentions a model family, and no family needs a
 `parallel_<family>_layer_spec`.
 
-For `v2`/`v3`/`v3_1`, `apply_surgery` additionally registers a `pre_wrap_hook` that
+For `v2`/`v3`/`v3_1`/`v3_2`/`v3_3`, `apply_surgery` additionally registers a `pre_wrap_hook` that
 installs each layer's reference to its neighbour's sublayers once the model is
 built (a layer spec describes a layer in isolation and cannot express this).
 Those references live in the layer's `__dict__` rather than as module
@@ -260,17 +271,19 @@ uv run python -m pytest tests/unit_tests/models/surgery/ -q
   references, group-of-one degeneracy, wiring, state-dict invariance, PP rejection
 - `test_merged_pool.py` — v3_1 joint routing against a hand-computed softmax, the
   `g·k` budget invariant, single-renormalization, router preconditions, gradient flow
-- `test_compensated.py` — v4 forward, reproducible init, freezing, manifest
+- `test_compensated.py` — v1_1 forward, reproducible init, freezing, manifest
   `adds_parameters`
-- `test_v4_hf_export.py` — HF graph selection, v4 forward, save/reload parity,
+- `test_cross_injection.py` — v3_2/v3_3 forward against hand-computed references,
+  zero-gate-equals-v3, norm placement, direction switch, gradient flow
+- `test_v1_1_hf_export.py` — HF graph selection, v1_1 forward, save/reload parity,
   and refusal to load cross-layer variants as sequential
 - `test_surgeon_cli.py` — clone and byte-exactness, manifest v1/v2, the
   training wire-up, config/checkpoint disagreement
 
 ## Handing a checkpoint to another team
 
-Only `v0`, `v1` and `v4` can be loaded by Hugging Face. `hf_reference.py`
-implements those three graphs and **raises** for `v2`/`v3`/`v3_1` rather than
+Only `v0`, `v1` and `v1_1` can be loaded by Hugging Face. `hf_reference.py`
+implements those three graphs and **raises** for `v2`/`v3`/`v3_1`/`v3_2`/`v3_3` rather than
 quietly running the sequential graph — a checkpoint that loads cleanly and
 reports wrong numbers is the failure mode worth guarding against.
 

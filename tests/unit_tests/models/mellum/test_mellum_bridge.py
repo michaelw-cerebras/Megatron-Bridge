@@ -92,6 +92,21 @@ def test_export_preserves_hybrid_rope(hf_config):
     assert result["rope_parameters"]["full_attention"]["attention_factor"] == pytest.approx(1.2772588722239782)
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "cross_gate.alpha",
+        "cross_gate.v_proj.weight",
+        "cross_gate.u_proj.weight",
+        "cross_gate.w_proj.weight",
+    ],
+)
+def test_cross_gate_parameters_have_import_export_mappings(suffix):
+    mapping = MellumBridge().mapping_registry().megatron_to_hf_lookup(f"decoder.layers.3.{suffix}")
+    assert mapping is not None
+    assert mapping.hf_param == f"model.layers.3.{suffix}"
+
+
 def test_hf_config_save_reload(hf_config, tmp_path):
     hf_config.save_pretrained(tmp_path)
     restored = AutoConfig.from_pretrained(tmp_path)

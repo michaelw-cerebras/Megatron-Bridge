@@ -1,0 +1,142 @@
+# thinking-v1_1: Mellum2 continued-pretraining case on one 8xH200 node.
+# One-node performance settings were measured on 8xH200; see model_surgeon/PERFORMANCE.md.
+# Dataset weights are percentages and intentionally total 100.
+# v1_1 = parallel attention/MLP plus Ivan's RMSNorm -> hidden-width SiLU MLP.
+# ALL original weights are frozen; only the newly added correction branches train.
+schema_version: 1
+
+model:
+  hf_path: /workspace/ml-olympus/codesign_pretrain/checkpoints/Mellum2-12B-A2.5B-Thinking-v1_1-compensated
+  architecture: v1_1
+
+train:
+  train_tokens: 10000000000
+  sequence_length: 8192
+  # Only the 297M correction parameters train, leaving enough memory to use
+  # MBS2 and halve gradient-accumulation overhead while keeping GBS unchanged.
+  micro_batch_size: 2
+  global_batch_size: 192
+  seed: 1234
+
+optimizer:
+  lr: 0.00003
+  min_lr: 0.000003
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 0.00000001
+  clip_grad: 1.0
+
+scheduler:
+  lr_decay_style: cosine
+  lr_warmup_iters: 1000
+
+parallelism:
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  context_parallel_size: 1
+  expert_model_parallel_size: 4
+  expert_tensor_parallel_size: 1
+
+performance:
+  precision: bf16
+  moe_token_dispatcher_type: alltoall
+  moe_permute_fusion: true
+
+dataset:
+  eod_id: 0  # Base tokenizer's document boundary; Thinking generation EOS is 28.
+  num_workers: 2
+  # Convergence experiment: accept unverified absence of renamed Base IDs 27-32.
+  # Use strict for a full bin scan. All mapping/checksum/bin/idx checks remain enabled.
+  reserved_token_check: skip
+
+  subsets:
+    # One weight per directory directly containing .bin/.idx files (including /data).
+    # Weights apply to leaf directories, not to the previous top-level dataset families.
+    # Only completed shards with .idx are selected; orphan .bin files are ignored.
+    # Never modify selected shards while preparing or training.
+
+    # Nemotron-CC-Code-v1
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-Code-v1/data: 2.1
+
+    # Nemotron-CC-Math-v1
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-Math-v1/3/data: 1.3
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-Math-v1/4plus/data: 2.9
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-Math-v1/4plus_MIND/data: 1.7
+
+    # Nemotron-CC-v2
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/Diverse-QA/data: 2.5
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/High-Quality-Synthetic/data: 7.902
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/High-Quality/data: 2.2
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/Medium-High-Quality/data: 1.9
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2/Translated-Diverse-QA/data: 1.0
+
+    # Nemotron-CC-v2.1
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/High-Quality-Synthetic/data: 15.698
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/High-Quality-Translated-To-English-Synthetic/data: 0.5
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/High-Quality-Translated-To-English/data: 0.5
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/High-Quality/data: 4.3
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/Medium-High-Quality-Synthetic/data: 6.2
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/Medium-High-Quality-Translated-To-English/data: 0.5
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-CC-v2.1/Medium-High-Quality/data: 3.8
+
+    # Nemotron-Pretraining-Legal-v1; used in nemotron phase 2 only; use for residual
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Legal-v1/data: 0.2
+
+    # Nemotron-Pretraining-Specialized-v1
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Math-Textbooks/data: 0.5
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-STEM-SFT/data: 9.2
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Scientific-Coding/data: 0.78
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1/Nemotron-Pretraining-Wiki-Rewrite/data: 0.6
+
+    # Nemotron-Pretraining-Specialized-v1.1
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Code-Concepts/data: 3.12
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Economics/data: 0.546
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.1/Nemotron-Pretraining-Formal-Logic/data: 0.39
+
+    # Nemotron-Pretraining-Specialized-v1.2
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Fact-Seeking/data: 0.546
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Generative/data: 0.858
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Moral-Scenarios/data: 0.234
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Nemotron-Pretraining-Specialized-v1.2/Nemotron-Pretraining-Multiple-Choice/data: 1.326
+
+    # Ultra-FineWeb; to replace nemotron medium quality + crawl++: 2.867 + 1.433 + 1.4
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Ultra-FineWeb/ultrafineweb_en_v1_4/data: 0.47
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Ultra-FineWeb/ultrafineweb_l1_en_hq/data: 0.46
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/Ultra-FineWeb/ultrafineweb_zh/data: 0.47
+
+
+    # finepdfs
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/finepdfs/data: 9.7
+
+    # peS2o
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/peS2o/data: 0.54
+
+    # pubmed
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/pubmed/data: 0.53
+
+    # stack-v3-train
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/stack-v3-train/data: 14.0
+
+    # uspto
+    /workspace/ml-olympus/codesign_pretrain/tokenized/mellum2/uspto/data: 0.53
+
+wandb:
+  enabled: true
+  base_url: https://cerebras.wandb.io
+  entity: team-inferenceml
+  project: draft_pretrain
+  run_name: mellum2_thinking-v1_1_10B
+  # API keys must come from the environment or container-side wandb login, never YAML.
+
+run:
+  directory: /workspace/ml-olympus/codesign_pretrain/runs/mellum2_thinking-v1_1_10B
+  # Save about every 3.8 hours at the measured one-node throughput.
+  save_interval: 100
+  keep_last_checkpoints: 3
+  log_interval: 10
+  resume_checkpoint: null
+
+  # Optional absolute optimizer-step limit for a short smoke; LR horizon stays unchanged.
+  exit_interval: null
+

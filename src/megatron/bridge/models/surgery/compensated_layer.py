@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Variant v4: parallel attention/MLP plus a trainable compensatory MLP."""
+"""Variant v1_1: parallel attention/MLP plus a trainable compensatory MLP."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
 
 
-VARIANT_ID = "v4"
+VARIANT_ID = "v1_1"
 
 
 class CompensatedParallelLayer(TransformerLayer):
@@ -52,9 +52,8 @@ class CompensatedParallelLayer(TransformerLayer):
     alongside them under ``compensatory_mlp``. The branch is the only trainable
     part of the model, frozen into place by the surgery pre-wrap hook.
 
-    Following slide 14, the correction branch reads the residual directly with
-    no norm of its own. Each layer has its own branch, so it can adapt to that
-    layer's residual scale.
+    The correction branch follows Ivan's implementation: it first applies its
+    own RMSNorm, then a hidden-width, non-gated SiLU MLP.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -66,8 +65,7 @@ class CompensatedParallelLayer(TransformerLayer):
         """
         super().__init__(*args, **kwargs)
         check_layer_support(self, variant_id=VARIANT_ID)
-        expansion = getattr(self.config, "surgery_correction_expansion_factor", 1)
-        setattr(self, CORRECTION_ATTRIBUTE, build_compensatory_mlp(self.config, expansion_factor=expansion))
+        setattr(self, CORRECTION_ATTRIBUTE, build_compensatory_mlp(self.config))
 
     def forward(
         self,
@@ -113,10 +111,10 @@ class CompensatedParallelLayer(TransformerLayer):
                 bias-producing correction branch is encountered.
         """
         if context_mask is not None:
-            raise ValueError("Model surgery variant v4 does not support cross-attention context masks")
+            raise ValueError("Model surgery variant v1_1 does not support cross-attention context masks")
         inference_context = deprecate_inference_params(inference_context, inference_params)
         if InferenceMode.is_active() and self.config.inference_fuse_tp_communication:
-            raise ValueError("Model surgery variant v4 does not support fused TP inference")
+            raise ValueError("Model surgery variant v1_1 does not support fused TP inference")
 
         residual = hidden_states.float() if self.config.fp32_residual_connection else hidden_states
         sublayers = sublayers_of(self)
@@ -138,10 +136,10 @@ class CompensatedParallelLayer(TransformerLayer):
         )
         mlp_output = run_mlp(sublayers, hidden_states, variant_id=VARIANT_ID, padding_mask=padding_mask)
 
-        # Third branch: reads the same residual, no norm, per slide 14.
+        # Third branch: RMSNorm -> up projection -> SiLU -> down projection.
         correction_output, correction_bias = apply_module(getattr(self, CORRECTION_ATTRIBUTE))(hidden_states)
         if correction_bias is not None:
-            raise ValueError("Model surgery variant v4 requires a bias-free correction branch")
+            raise ValueError("Model surgery variant v1_1 requires a bias-free correction branch")
 
         output = residual + attention_output + mlp_output + correction_output
         output = make_viewless_tensor(inp=output, requires_grad=output.requires_grad, keep_graph=True)
